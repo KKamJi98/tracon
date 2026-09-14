@@ -36,6 +36,10 @@ pub struct Collector {
     // 끝내 나타나지 않으므로 1단계 캐시(`codex_paths`만으로는 uuid를 어떤 pid에
     // 물려야 하는지 알 길이 없어) 매 tick 날짜 트리를 다시 훑게 된다.
     codex_pid_uuid: std::collections::HashMap<i32, String>,
+    // `--session-id` 없이 뜬 claude 프로세스를 위한 pid -> uuid 캐시. codex 쪽과
+    // 같은 이유이자 같은 모양이다 - 이게 없으면 배정 기준이 mtime뿐이라, 같은 cwd의
+    // 두 세션이 번갈아 쓸 때 tick마다 배정이 맞바뀐다.
+    claude_pid_uuid: std::collections::HashMap<i32, String>,
     sink_dir: PathBuf,
     // tmux list-panes 같은 비용이 드는 조회는 tick당 딱 한 번(refresh)만 하고,
     // 세션마다 하는 resolve_tty는 그 캐시를 읽는 순수 조회다.
@@ -123,6 +127,7 @@ impl Collector {
             codex_trackers: std::collections::HashMap::new(),
             codex_paths: std::collections::HashMap::new(),
             codex_pid_uuid: std::collections::HashMap::new(),
+            claude_pid_uuid: std::collections::HashMap::new(),
             sink_dir: hooksink::sink_dir(),
             jumpers: Vec::new(),
             cmux_subscriber: None,
@@ -319,12 +324,30 @@ impl Collector {
                     let Some(cwd) = p.cwd.as_ref() else {
                         continue;
                     };
-                    let pick = transcripts_for_cwd(&self.projects_root, cwd)
-                        .into_iter()
-                        .find(|(_, path, _)| !claimed.contains(path));
+                    // 지난 tick에 이 pid가 가져간 transcript를 먼저 되찾는다.
+                    // mtime 순서는 tick 사이에 뒤집히므로, 이 캐시가 없으면 같은
+                    // cwd의 두 세션이 배정을 맞바꾼다 - 선택이 튀고, 복사되는
+                    // `claude --resume <uuid>`가 엉뚱한 세션을 가리킨다.
+                    let cached = self
+                        .claude_pid_uuid
+                        .get(&p.pid)
+                        .map(|uuid| {
+                            (
+                                uuid.clone(),
+                                transcript_path_for(&self.projects_root, cwd, uuid),
+                            )
+                        })
+                        .filter(|(_, path)| !claimed.contains(path) && path.exists());
+                    let pick = cached.or_else(|| {
+                        transcripts_for_cwd(&self.projects_root, cwd)
+                            .into_iter()
+                            .find(|(_, path, _)| !claimed.contains(path))
+                            .map(|(uuid, path, _)| (uuid, path))
+                    });
                     match pick {
-                        Some((uuid, path, _)) => {
+                        Some((uuid, path)) => {
                             claimed.insert(path.clone());
+                            self.claude_pid_uuid.insert(p.pid, uuid.clone());
                             (
                                 SessionKey {
                                     provider: p.provider,
@@ -503,6 +526,10 @@ impl Collector {
             .collect();
         self.codex_pid_uuid
             .retain(|_, uuid| alive_codex_uuids.contains(uuid));
+        // claude 쪽 pid 캐시는 프로세스가 사라지면 쓸모가 없다 - 살아 있는 pid만 남긴다.
+        let live_pids: std::collections::HashSet<i32> = live.iter().map(|p| p.pid).collect();
+        self.claude_pid_uuid
+            .retain(|pid, _| live_pids.contains(pid));
         // uuid별 codex 경로 캐시도 같은 이유로 정리한다 - 더는 살아있지 않은
         // 세션의 경로를 무한정 들고 있으면 장시간 폴링에서 메모리가 계속 는다.
         self.codex_paths
@@ -765,6 +792,52 @@ mod tests {
 
         assert_eq!(snap.sessions.len(), 2);
         assert_ne!(snap.sessions[0].key, snap.sessions[1].key);
+    }
+
+    /// `--session-id` 없이 뜬 claude 프로세스는 같은 cwd에서 mtime이 가장 최근인
+    /// 미배정 transcript를 가져간다. 두 세션이 같은 cwd에서 번갈아 쓰면 mtime 순서가
+    /// tick 사이에 뒤집히고, 캐시가 없으면 배정이 통째로 맞바뀐다 - TUI 선택이 튀고,
+    /// 복사되는 `claude --resume <uuid>`가 엉뚱한 세션을 가리킨다.
+    #[test]
+    fn claude_processes_without_session_id_keep_their_transcript_across_mtime_flips() {
+        fn pairs(snap: &crate::json::Snapshot) -> Vec<(Option<i32>, String)> {
+            let mut v: Vec<(Option<i32>, String)> = snap
+                .sessions
+                .iter()
+                .map(|s| (s.pid, s.key.uuid.clone()))
+                .collect();
+            v.sort();
+            v
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::fs::write(proj.join("aaa.jsonl"), "").expect("write aaa");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(proj.join("bbb.jsonl"), "").expect("write bbb");
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![
+                proc_with(200, None, "/home/dev/app", 0.0),
+                proc_with(201, None, "/home/dev/app", 0.0),
+            ])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+
+        let first = pairs(&c.snapshot(NOW));
+        assert_eq!(first.len(), 2);
+
+        // 두 번째 tick 전에 mtime 순서를 뒤집는다.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(proj.join("aaa.jsonl"), "").expect("touch aaa");
+
+        assert_eq!(
+            pairs(&c.snapshot(NOW + 1_000)),
+            first,
+            "mtime이 뒤집혀도 pid별 transcript 배정은 그대로여야 한다"
+        );
     }
 
     #[test]

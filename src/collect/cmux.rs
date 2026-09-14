@@ -8,6 +8,7 @@ use crate::collect::transcript::parse_ts_ms;
 use crate::model::{Confidence, Observation, Provider, SessionKey, Source};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -120,19 +121,28 @@ impl CmuxSubscriber {
     fn spawn_inner(reconnect: bool) -> Option<Self> {
         let state_dir = crate::collect::hooksink::sink_dir();
         let _ = std::fs::create_dir_all(&state_dir);
-        let cursor_file = state_dir.join("cmux.cursor").to_string_lossy().into_owned();
-        let mut args = vec![
-            "events".to_string(),
-            "--category".to_string(),
-            "agent".to_string(),
-            "--cursor-file".to_string(),
-            cursor_file,
-        ];
-        if reconnect {
-            args.push("--reconnect".to_string());
-        }
-        spawn_with("cmux", &args)
+        spawn_with("cmux", &events_args(reconnect, &state_dir))
     }
+}
+
+/// `cmux events`에 넘길 인자를 만든다.
+///
+/// 커서 파일은 오래 사는 구독(TUI)만 쓴다. `--json`의 1회성 자식과 커서를 공유하면,
+/// 먼저 끝나는 쪽이 커서를 TUI가 아직 읽지 못한 지점 너머로 밀어 이벤트를 삼킨다 -
+/// README가 권하는 "TUI를 띄운 채 statusline에서 --json 폴링"이 바로 그 조합이다.
+/// 1회성 호출은 애초에 이어받을 구간이 없으므로 커서 자체가 필요 없다.
+fn events_args(reconnect: bool, state_dir: &Path) -> Vec<String> {
+    let mut args = vec![
+        "events".to_string(),
+        "--category".to_string(),
+        "agent".to_string(),
+    ];
+    if reconnect {
+        args.push("--cursor-file".to_string());
+        args.push(state_dir.join("cmux.cursor").to_string_lossy().into_owned());
+        args.push("--reconnect".to_string());
+    }
+    args
 }
 
 impl Drop for CmuxSubscriber {
@@ -198,6 +208,27 @@ fn spawn_with(program: &str, args: &[String]) -> Option<CmuxSubscriber> {
 mod tests {
     use super::*;
     use crate::model::{HookEvent, Provider};
+
+    /// TUI 구독과 `--json` 1회 호출이 같은 커서 파일을 쓰면, 짧게 살다 죽는 후자가
+    /// 커서를 TUI가 아직 읽지 못한 지점 너머로 밀어버린다. README가 권하는 "TUI를
+    /// 띄운 채 statusline에서 --json 폴링"이 정확히 그 조합이다.
+    #[test]
+    fn the_one_shot_subscription_does_not_share_the_cursor_file() {
+        let args = events_args(false, Path::new("/state"));
+        assert!(
+            !args.iter().any(|a| a.contains("cursor")),
+            "1회성 구독은 커서 파일을 쓰지 않는다: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--reconnect"));
+    }
+
+    #[test]
+    fn the_long_lived_subscription_keeps_its_cursor_file_and_reconnects() {
+        let args = events_args(true, Path::new("/state"));
+        assert!(args.iter().any(|a| a == "--cursor-file"));
+        assert!(args.iter().any(|a| a == "/state/cmux.cursor"));
+        assert!(args.iter().any(|a| a == "--reconnect"));
+    }
 
     const NDJSON: &str = include_str!("../../tests/fixtures/cmux_event.ndjson");
 
