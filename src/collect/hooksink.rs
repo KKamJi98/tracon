@@ -37,7 +37,11 @@ pub fn sink_dir() -> PathBuf {
 pub fn record_event(dir: &Path, rec: &SinkRecord) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", sanitize(&rec.key.uuid)));
-    let tmp = path.with_extension("json.tmp");
+    let tmp = dir.join(format!(
+        "{}.json.{}.tmp",
+        sanitize(&rec.key.uuid),
+        std::process::id()
+    ));
     std::fs::write(&tmp, serde_json::to_vec(rec)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
@@ -59,6 +63,10 @@ fn sanitize(uuid: &str) -> String {
     uuid.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect()
+}
+
+fn temp_path(dir: &Path, uuid: &str, pid: u32) -> PathBuf {
+    dir.join(format!("{}.json.{}.tmp", sanitize(uuid), pid))
 }
 
 #[derive(Deserialize)]
@@ -172,5 +180,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         std::fs::write(dir.path().join("broken.json"), "{oops").expect("write");
         assert_eq!(read_all(dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn concurrent_writes_to_same_session_use_different_temp_paths() {
+        let dir = tempfile::tempdir().expect("dir");
+        let uuid = "concurrent-session";
+        let pid1 = 1000u32;
+        let pid2 = 2000u32;
+        let tmp1 = temp_path(dir.path(), uuid, pid1);
+        let tmp2 = temp_path(dir.path(), uuid, pid2);
+        assert_ne!(tmp1, tmp2);
+        assert!(tmp1.to_string_lossy().contains("1000"));
+        assert!(tmp2.to_string_lossy().contains("2000"));
     }
 }
