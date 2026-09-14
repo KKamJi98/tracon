@@ -12,7 +12,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use std::io::{stdout, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,8 +55,9 @@ pub fn ctx_bar(pct: u32) -> String {
     bar
 }
 
-/// 키 입력이 요청하는 동작. `Jump`/`CopyResume`/`Kill`은 여기서 반환만 되고,
-/// 실제 배선은 다음 task에서 한다 - 이 task에서는 순수하게 inert 하다.
+/// 키 입력이 요청하는 동작. `on_key`는 순수하게 동작을 반환만 하고, 실제 실행은
+/// `handle_action`이 한다 - 헤드리스로 테스트하기 위해서다. `Kill`은 프로세스를
+/// 죽이는 범위가 이 task 밖이라 여전히 inert 하다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -71,6 +73,9 @@ pub enum Action {
 pub struct App {
     pub snapshot: Snapshot,
     pub selected: usize,
+    /// 클립보드 복사가 전부 실패했을 때 대신 보여줄 명령 문자열. 상태줄에 한 줄만
+    /// 띄우고, 다음 Jump/CopyResume 액션이 오면 덮어쓴다.
+    pub message: Option<String>,
 }
 
 impl App {
@@ -78,6 +83,7 @@ impl App {
         Self {
             snapshot,
             selected: 0,
+            message: None,
         }
     }
 
@@ -118,6 +124,50 @@ impl App {
             KeyCode::Char('s') => Action::ToggleSort,
             _ => Action::None,
         }
+    }
+}
+
+/// resume 명령을 클립보드에 복사하고, 실패하면 그 명령 문자열 자체를 상태줄에
+/// 보여줄 메시지로 돌려준다.
+fn copy_or_show(cmd: String) -> String {
+    if crate::jump::clipboard::copy(&cmd) {
+        format!("복사됨: {cmd}")
+    } else {
+        cmd
+    }
+}
+
+/// `Action::Jump`/`Action::CopyResume`를 실제로 실행한다. `Action::Kill`과
+/// `Action::ToggleSort`/`Action::None`/`Action::Quit`은 이 task 범위 밖이거나
+/// 이미 `event_loop`에서 처리되어 여기서는 아무것도 하지 않는다.
+fn handle_action(app: &mut App, action: Action) {
+    match action {
+        Action::Jump(i) => {
+            let Some(session) = app.snapshot.sessions.get(i) else {
+                return;
+            };
+            let jump_label = session.jump.clone();
+            let resume_cmd = crate::jump::resume_command(session);
+            // tmux 대상이 있고 실제로 그 pane까지 옮겨갔으면 끝 - 아니면(대상이
+            // 없거나, 있어도 클라이언트가 안 붙어 있어 실패했으면) resume 명령
+            // 복사로 폴백한다. 이게 터미널 중립성을 지키는 지점이다.
+            if jump_label
+                .as_deref()
+                .is_some_and(|label| crate::jump::jump_to(label).is_ok())
+            {
+                app.message = None;
+                return;
+            }
+            app.message = Some(copy_or_show(resume_cmd));
+        }
+        Action::CopyResume(i) => {
+            let Some(session) = app.snapshot.sessions.get(i) else {
+                return;
+            };
+            let resume_cmd = crate::jump::resume_command(session);
+            app.message = Some(copy_or_show(resume_cmd));
+        }
+        Action::Kill(_) | Action::ToggleSort | Action::None | Action::Quit => {}
     }
 }
 
@@ -163,7 +213,8 @@ pub fn run_tui() -> anyhow::Result<()> {
     let mut collector = crate::collect::Collector::new(
         Box::new(crate::collect::proc::SysProcessSource::new()),
         crate::config::Thresholds::default(),
-    );
+    )
+    .with_jumpers(vec![Box::new(crate::jump::tmux::TmuxJumper::new())]);
     // 첫 프레임은 백그라운드 스레드의 1초 tick을 기다리지 않고 즉시 그린다.
     let mut app = App::new(collector.snapshot(crate::collect::hooksink::now_ms()));
 
@@ -235,12 +286,33 @@ fn event_loop<B: Backend>(
     rx: &mpsc::Receiver<Snapshot>,
 ) -> anyhow::Result<ExitReason> {
     loop {
-        terminal.draw(|f| render(f, &app.snapshot, app.selected))?;
+        terminal.draw(|f| {
+            render(f, &app.snapshot, app.selected);
+            // 클립보드 폴백 메시지는 render()가 그리는 고정 레이아웃과 별개로,
+            // 화면 맨 아래 한 줄에 덧그린다 - render()는 테스트가 직접 호출하는
+            // 순수 함수라 시그니처를 바꾸고 싶지 않다.
+            if let Some(msg) = &app.message {
+                let area = f.area();
+                if area.height > 0 {
+                    let bar = Rect {
+                        x: area.x,
+                        y: area.y + area.height - 1,
+                        width: area.width,
+                        height: 1,
+                    };
+                    f.render_widget(Paragraph::new(msg.as_str()), bar);
+                }
+            }
+        })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && app.on_key(key.code) == Action::Quit {
-                    return Ok(ExitReason::Quit);
+                if key.kind == KeyEventKind::Press {
+                    let action = app.on_key(key.code);
+                    if action == Action::Quit {
+                        return Ok(ExitReason::Quit);
+                    }
+                    handle_action(app, action);
                 }
             }
         }

@@ -7,6 +7,7 @@ pub mod transcript;
 use crate::collect::proc::{ProcInfo, ProcessSource};
 use crate::config::Thresholds;
 use crate::json::{sort_sessions, Snapshot};
+use crate::jump::Jumper;
 use crate::merge::winner;
 use crate::model::{Observation, Session, SessionKey, Source};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,9 @@ pub struct Collector {
     trackers: std::collections::HashMap<PathBuf, transcript::TranscriptTracker>,
     projects_root: PathBuf,
     sink_dir: PathBuf,
+    // tmux list-panes 같은 비용이 드는 조회는 tick당 딱 한 번(refresh)만 하고,
+    // 세션마다 하는 resolve_tty는 그 캐시를 읽는 순수 조회다.
+    jumpers: Vec<Box<dyn Jumper>>,
 }
 
 /// `/home/dev/code/app` -> `-home-dev-code-app`
@@ -93,6 +97,7 @@ impl Collector {
             trackers: std::collections::HashMap::new(),
             projects_root: home.join(".claude/projects"),
             sink_dir: hooksink::sink_dir(),
+            jumpers: Vec::new(),
         }
     }
 
@@ -108,10 +113,24 @@ impl Collector {
         self
     }
 
+    /// 점프 대상을 찾아낼 소스를 등록한다. 테스트는 가짜 Jumper를 주입해 tmux를
+    /// 실제로 띄우지 않고도 resolve_tty 경로를 검증할 수 있다.
+    pub fn with_jumpers(mut self, jumpers: Vec<Box<dyn Jumper>>) -> Self {
+        self.jumpers = jumpers;
+        self
+    }
+
     pub fn snapshot(&mut self, now_ms: i64) -> Snapshot {
         let live: Vec<ProcInfo> = self.procs.list_agents();
         let sink_records = hooksink::read_all(&self.sink_dir);
         let hooks_installed = !sink_records.is_empty();
+
+        // tmux list-panes 같은 비용이 드는 조회는 세션 수와 무관하게 tick당 한 번만
+        // 한다. 아래에서 세션마다 부르는 resolve_tty는 이 캐시를 읽기만 하는 순수
+        // 조회라 20세션이어도 새 프로세스가 늘지 않는다.
+        for jumper in &mut self.jumpers {
+            jumper.refresh();
+        }
 
         // transcript 배정을 프로세스 순회보다 먼저 전부 끝낸다. session_id가 같은
         // 프로세스(부모/워커)는 하나의 세션으로 합치고 - Tailer가 같은 파일을 두 번
@@ -207,6 +226,11 @@ impl Collector {
             let last_change = summary.as_ref().map(|s| s.last_ts_ms).unwrap_or(now_ms);
             let ctx_tokens = summary.as_ref().and_then(|s| s.usage.map(|u| u.total()));
             let model = summary.as_ref().and_then(|s| s.model.clone());
+            let jump = p.tty.as_deref().and_then(|tty| {
+                self.jumpers
+                    .iter()
+                    .find_map(|jumper| jumper.resolve_tty(tty))
+            });
 
             sessions.push(Session {
                 key: key.clone(),
@@ -222,7 +246,7 @@ impl Collector {
                 model,
                 cpu: Some(p.cpu),
                 pid: Some(p.pid),
-                jump: None,
+                jump: jump.map(|t| t.label()),
             });
         }
 
@@ -530,6 +554,66 @@ mod tests {
         // running again instead of still being stuck on the resolved tool_use.
         assert_ne!(second.sessions[0].state, State::WaitingApproval);
         assert_eq!(second.sessions[0].state, State::RunningInference);
+    }
+
+    struct FakeJumper {
+        panes: std::collections::HashMap<String, String>,
+        refresh_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl crate::jump::Jumper for FakeJumper {
+        fn refresh(&mut self) {
+            self.refresh_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn resolve_tty(&self, tty: &str) -> Option<crate::jump::JumpTarget> {
+            self.panes
+                .get(tty)
+                .cloned()
+                .map(crate::jump::JumpTarget::Tmux)
+        }
+    }
+
+    #[test]
+    fn jump_label_is_filled_from_injected_jumper_and_refreshed_once_per_snapshot() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut panes = std::collections::HashMap::new();
+        panes.insert("/dev/ttys004".to_string(), "main:2.1".to_string());
+        let refresh_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let jumper = FakeJumper {
+            panes,
+            refresh_calls: refresh_calls.clone(),
+        };
+
+        let mut p1 = proc_with(100, Some("u1"), "/home/dev/app", 0.0);
+        p1.tty = Some("/dev/ttys004".to_string());
+        let mut p2 = proc_with(101, Some("u2"), "/home/dev/app2", 0.0);
+        p2.tty = Some("/dev/ttys999".to_string());
+
+        let mut c = super::Collector::new(Box::new(FakeProcs(vec![p1, p2])), Thresholds::default())
+            .with_projects_root(dir.path().to_path_buf())
+            .with_jumpers(vec![Box::new(jumper)]);
+
+        let snap = c.snapshot(NOW);
+
+        let s1 = snap
+            .sessions
+            .iter()
+            .find(|s| s.key.uuid == "u1")
+            .expect("u1 present");
+        assert_eq!(s1.jump.as_deref(), Some("tmux:main:2.1"));
+
+        let s2 = snap
+            .sessions
+            .iter()
+            .find(|s| s.key.uuid == "u2")
+            .expect("u2 present");
+        assert_eq!(s2.jump, None, "unknown tty must not get a jump target");
+
+        // refresh는 세션이 몇 개든 tick당 한 번만 불려야 한다 - list-panes를
+        // 세션마다 새로 띄우면 20세션에서 spawn이 20배로 늘어 성능 예산을 깬다.
+        assert_eq!(refresh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

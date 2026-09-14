@@ -4,6 +4,7 @@ mod collect;
 mod config;
 mod hooks;
 mod json;
+mod jump;
 mod merge;
 mod model;
 mod ui;
@@ -110,7 +111,8 @@ fn run_json() -> anyhow::Result<()> {
     let mut collector = crate::collect::Collector::new(
         Box::new(crate::collect::proc::SysProcessSource::new()),
         crate::config::Thresholds::default(),
-    );
+    )
+    .with_jumpers(vec![Box::new(crate::jump::tmux::TmuxJumper::new())]);
     let snapshot = collector.snapshot(crate::collect::hooksink::now_ms());
     println!("{}", serde_json::to_string(&snapshot)?);
     Ok(())
