@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +28,7 @@ pub struct TailSummary {
     pub pending_tool_use: usize,
     pub usage: Option<Usage>,
     pub model: Option<String>,
+    #[allow(dead_code)]
     pub cwd: Option<String>,
 }
 

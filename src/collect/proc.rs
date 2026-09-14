@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::model::Provider;
 use std::path::PathBuf;
 
@@ -12,6 +10,7 @@ pub struct ProcInfo {
     pub cpu: f32,
     /// UTC epoch milliseconds
     pub started_at_ms: i64,
+    #[allow(dead_code)]
     pub tty: Option<String>,
 }
 

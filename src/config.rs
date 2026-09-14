@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
     /// Waiting이 이 시간을 넘기면 Idle로 강등한다.

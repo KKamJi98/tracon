@@ -12,7 +12,6 @@ pub struct SinkRecord {
 }
 
 impl SinkRecord {
-    #[allow(dead_code)]
     pub fn to_observation(&self) -> Option<Observation> {
         let state = crate::model::transition(None, self.event)?;
         Some(Observation {
@@ -46,7 +45,6 @@ pub fn record_event(dir: &Path, rec: &SinkRecord) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn read_all(dir: &Path) -> Vec<SinkRecord> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();

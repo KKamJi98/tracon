@@ -1,7 +1,6 @@
 use crate::model::{Observation, Source, State};
 
 /// 같은 세션에 대한 여러 관측 중 화면에 쓸 하나를 고른다.
-#[allow(dead_code)]
 pub fn winner(observations: &[Observation]) -> Option<&Observation> {
     if observations.is_empty() {
         return None;

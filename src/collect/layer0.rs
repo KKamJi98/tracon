@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::collect::transcript::{EntryKind, TailSummary};
 use crate::config::Thresholds;
 use crate::model::{demote, Confidence, State};

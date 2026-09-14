@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::model::{Color, Session};
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +10,7 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub struct Counts {
     pub waiting: usize,
     pub running: usize,
@@ -20,6 +19,7 @@ pub struct Counts {
 }
 
 impl Snapshot {
+    #[allow(dead_code)]
     pub fn counts(&self) -> Counts {
         let mut c = Counts::default();
         for s in &self.sessions {

@@ -95,7 +95,6 @@ pub enum HookEvent {
 }
 
 /// 훅 이벤트 하나를 상태로 옮긴다. `None`은 이전 상태 유지를 뜻한다.
-#[allow(dead_code)]
 pub fn transition(_prev: Option<State>, event: HookEvent) -> Option<State> {
     match event {
         HookEvent::SessionStart => Some(State::Idle),

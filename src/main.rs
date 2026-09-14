@@ -106,12 +106,11 @@ fn run_hooks(action: HooksAction) -> anyhow::Result<()> {
 }
 
 fn run_json() -> anyhow::Result<()> {
-    let snapshot = crate::json::Snapshot {
-        sessions: Vec::new(),
-        hooks_installed: false,
-        cmux_linked: false,
-        generated_at_ms: crate::collect::hooksink::now_ms(),
-    };
+    let mut collector = crate::collect::Collector::new(
+        Box::new(crate::collect::proc::SysProcessSource::new()),
+        crate::config::Thresholds::default(),
+    );
+    let snapshot = collector.snapshot(crate::collect::hooksink::now_ms());
     println!("{}", serde_json::to_string(&snapshot)?);
     Ok(())
 }
