@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,6 +95,7 @@ pub enum HookEvent {
 }
 
 /// 훅 이벤트 하나를 상태로 옮긴다. `None`은 이전 상태 유지를 뜻한다.
+#[allow(dead_code)]
 pub fn transition(_prev: Option<State>, event: HookEvent) -> Option<State> {
     match event {
         HookEvent::SessionStart => Some(State::Idle),
@@ -121,6 +120,36 @@ pub fn demote(state: State, since_change_ms: i64, cfg: &crate::config::Threshold
         return State::Idle;
     }
     state
+}
+
+/// 화면 한 줄에 대응하는, 병합이 끝난 세션 스냅샷 행.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub key: SessionKey,
+    pub state: State,
+    pub source: Source,
+    pub confidence: Confidence,
+    /// 마지막 상태 전이 시각. UTC epoch ms
+    pub last_change_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub ctx_tokens: Option<u64>,
+    pub ctx_window: Option<u64>,
+    pub cpu: Option<f32>,
+    pub pid: Option<i32>,
+    pub jump: Option<String>,
+}
+
+impl Session {
+    #[allow(dead_code)]
+    pub fn ctx_pct(&self) -> Option<u32> {
+        let (t, w) = (self.ctx_tokens?, self.ctx_window?);
+        if w == 0 {
+            return None;
+        }
+        Some(((t as f64 / w as f64) * 100.0).round() as u32)
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::Context;
 use serde_json::{json, Value};
 use std::path::Path;

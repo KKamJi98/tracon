@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::model::{Confidence, HookEvent, Observation, Provider, SessionKey, Source};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -14,6 +12,7 @@ pub struct SinkRecord {
 }
 
 impl SinkRecord {
+    #[allow(dead_code)]
     pub fn to_observation(&self) -> Option<Observation> {
         let state = crate::model::transition(None, self.event)?;
         Some(Observation {
@@ -47,6 +46,7 @@ pub fn record_event(dir: &Path, rec: &SinkRecord) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn read_all(dir: &Path) -> Vec<SinkRecord> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -65,6 +65,7 @@ fn sanitize(uuid: &str) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 fn temp_path(dir: &Path, uuid: &str, pid: u32) -> PathBuf {
     dir.join(format!("{}.json.{}.tmp", sanitize(uuid), pid))
 }
