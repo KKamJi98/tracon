@@ -8,8 +8,9 @@ use crate::collect::transcript::parse_ts_ms;
 use crate::model::{Confidence, Observation, Provider, SessionKey, Source};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// cmux 이벤트 스트림에서 뽑아낸 hook 이벤트 한 건. `record`는 Layer 1과 같은
@@ -93,34 +94,61 @@ fn split_session_id(session_id: &str) -> Option<(Provider, String)> {
     None
 }
 
-/// `cmux events`를 자식 프로세스로 띄워 stdout을 줄 단위로 읽는 구독.
-pub struct CmuxSubscriber;
+/// `cmux events`를 자식 프로세스로 띄워 stdout을 줄 단위로 읽는 구독. 이 구조체가
+/// `Child`를 들고 있다가 [`Drop`]에서 죽이는 이유는, 그렇게 하지 않으면 구독을
+/// 그만 쓰는 모든 호출부가 "자식을 죽여야 한다"는 걸 따로 기억해야 하기 때문이다 -
+/// 정상 반환이든 에러 경로든 값이 스코프를 벗어나는 순간 자동으로 정리된다.
+pub struct CmuxSubscriber {
+    pub(crate) rx: Receiver<CmuxEvent>,
+    child: Arc<Mutex<Child>>,
+}
 
 impl CmuxSubscriber {
-    /// 구독을 시작한다. `cmux` 실행 파일이 없거나, 있어도 인자를 못 알아듣고
-    /// 곧바로 죽으면 `None`을 돌려준다 - 이 경우 호출부는 레이어 2 없이 그대로
-    /// 동작해야 한다(터미널 중립성). 성공하면 파싱된 이벤트를 실어 나르는
-    /// 채널의 수신 쪽을 돌려준다.
-    pub fn spawn() -> Option<Receiver<CmuxEvent>> {
+    /// 오래 사는 구독(TUI). 연결이 끊기면 `--reconnect`가 알아서 재연결한다.
+    pub fn spawn() -> Option<Self> {
+        Self::spawn_inner(true)
+    }
+
+    /// 스냅샷 한 번만 찍고 끝나는 호출(`--json`)용. `--reconnect`를 붙이지 않는다 -
+    /// 한 번 쓰고 버릴 구독을 재연결까지 시도하게 둘 이유가 없고, 호출부가 스냅샷을
+    /// 찍자마자 이 값을 버려(drop) 자식을 죽여야 한다 - 그러지 않으면 폴링할 때마다
+    /// cmux 데몬에 고아 프로세스가 하나씩 쌓인다.
+    pub fn spawn_one_shot() -> Option<Self> {
+        Self::spawn_inner(false)
+    }
+
+    fn spawn_inner(reconnect: bool) -> Option<Self> {
         let state_dir = crate::collect::hooksink::sink_dir();
         let _ = std::fs::create_dir_all(&state_dir);
         let cursor_file = state_dir.join("cmux.cursor").to_string_lossy().into_owned();
-        spawn_with(
-            "cmux",
-            &[
-                "events".to_string(),
-                "--category".to_string(),
-                "agent".to_string(),
-                "--reconnect".to_string(),
-                "--cursor-file".to_string(),
-                cursor_file,
-            ],
-        )
+        let mut args = vec![
+            "events".to_string(),
+            "--category".to_string(),
+            "agent".to_string(),
+            "--cursor-file".to_string(),
+            cursor_file,
+        ];
+        if reconnect {
+            args.push("--reconnect".to_string());
+        }
+        spawn_with("cmux", &args)
+    }
+}
+
+impl Drop for CmuxSubscriber {
+    /// 죽은 자식을 다시 죽이는 것도(`kill()`이 ESRCH만 돌려줄 뿐 패닉하지 않는다),
+    /// wedge된 자식을 기다리는 것도(`kill()` 뒤의 `wait()`라 금방 끝난다) 안전해야
+    /// 한다는 요구를 그대로 따른다.
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 /// 테스트에서 가짜 명령을 주입할 수 있게 `spawn`에서 떼어낸 실제 구현.
-fn spawn_with(program: &str, args: &[String]) -> Option<Receiver<CmuxEvent>> {
+fn spawn_with(program: &str, args: &[String]) -> Option<CmuxSubscriber> {
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -145,6 +173,8 @@ fn spawn_with(program: &str, args: &[String]) -> Option<Receiver<CmuxEvent>> {
     }
 
     let stdout = child.stdout.take()?;
+    let child = Arc::new(Mutex::new(child));
+    let reader_child = Arc::clone(&child);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -156,9 +186,12 @@ fn spawn_with(program: &str, args: &[String]) -> Option<Receiver<CmuxEvent>> {
                 }
             }
         }
-        let _ = child.wait();
+        // 자식이 스스로 끝났을 뿐이라면(우리가 죽인 게 아니라면) 좀비로 남지 않게
+        // 여기서 거둔다. `CmuxSubscriber::drop`이 이미 거뒀다면 이 `wait()`는
+        // "그런 자식 없음" 에러로 조용히 끝난다 - 둘 다 안전해야 하므로 무시한다.
+        let _ = reader_child.lock().map(|mut c| c.wait());
     });
-    Some(rx)
+    Some(CmuxSubscriber { rx, child })
 }
 
 #[cfg(test)]
@@ -226,20 +259,69 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/cmux_event.ndjson"
         );
-        let rx = spawn_with("cat", &[fixture_path.to_string()]).expect("subscription");
+        let sub = spawn_with("cat", &[fixture_path.to_string()]).expect("subscription");
 
-        let first = rx
+        let first = sub
+            .rx
             .recv_timeout(Duration::from_secs(2))
             .expect("first event");
         assert_eq!(
             first.record.key.uuid,
             "11111111-2222-3333-4444-555555555555"
         );
-        let second = rx
+        let second = sub
+            .rx
             .recv_timeout(Duration::from_secs(2))
             .expect("second event");
         assert_eq!(second.record.event, HookEvent::PermissionRequest);
         // 세 번째 줄은 category가 agent가 아니라서 걸러진다 - 채널은 곧 끊긴다.
-        assert!(rx.recv_timeout(Duration::from_secs(2)).is_err());
+        assert!(sub.rx.recv_timeout(Duration::from_secs(2)).is_err());
+    }
+
+    /// 리뷰 지적: `spawn_with`가 자식을 살려 둔 채 반환되면(원래 구현이 그랬다),
+    /// `--json` 같은 1회성 호출은 스냅샷을 찍고 끝나도 `cmux events --reconnect`
+    /// 자식이 살아남아 cmux 데몬에 고아로 쌓인다. `CmuxSubscriber`를 버리는 순간
+    /// (Drop) 진짜로 죽는지 - 진짜 cmux 없이, 오래 사는 `sleep 30`으로 - 검증한다.
+    #[test]
+    fn dropping_the_subscriber_kills_the_child_process() {
+        let sub = spawn_with("sleep", &["30".to_string()]).expect("subscription");
+        let pid = sub.child.lock().expect("lock").id();
+
+        // sleep이 실제로 떠 있는지부터 확인한다 - 그래야 아래에서 "사라졌다"는
+        // 주장이 "애초에 없었다"가 아니라 진짜 종료를 뜻한다.
+        assert!(
+            process_is_alive(pid),
+            "sleep 30 must be running before drop"
+        );
+
+        drop(sub);
+
+        // kill()은 비동기 신호일 뿐이라 커널이 실제로 회수할 때까지 아주 잠깐의
+        // 여유를 둔다 - 하지만 몇 초씩 걸리면 안 된다(고아가 "언젠가" 죽는 게
+        // 아니라 즉시 죽어야 한다는 게 이 리뷰의 요지다).
+        let mut alive = process_is_alive(pid);
+        for _ in 0..20 {
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            alive = process_is_alive(pid);
+        }
+        assert!(
+            !alive,
+            "child must be terminated once the subscriber is dropped"
+        );
+    }
+
+    /// `kill -0 <pid>`로 프로세스 존재 여부만 확인한다 - 실제 cmux 바이너리에
+    /// 의존하지 않고, 표준 유닉스 유틸리티(`sleep`, `kill`)만으로 결정적으로 돈다.
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }

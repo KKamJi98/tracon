@@ -28,7 +28,7 @@ pub struct Collector {
     jumpers: Vec<Box<dyn Jumper>>,
     // 레이어 2(cmux). None이면 cmux가 없거나 아직 연결을 시도하지 않은 것 -
     // 이 경우 나머지 전부는 cmux가 존재한 적 없는 것처럼 그대로 동작해야 한다.
-    cmux_rx: Option<std::sync::mpsc::Receiver<cmux::CmuxEvent>>,
+    cmux_subscriber: Option<cmux::CmuxSubscriber>,
     cmux_linked: bool,
     cmux_jumper: Option<crate::jump::cmux::CmuxJumper>,
     // 세션마다 마지막으로 본 cmux workspace_id. cmux 이벤트가 tick마다 오지는
@@ -107,7 +107,7 @@ impl Collector {
             projects_root: home.join(".claude/projects"),
             sink_dir: hooksink::sink_dir(),
             jumpers: Vec::new(),
-            cmux_rx: None,
+            cmux_subscriber: None,
             cmux_linked: false,
             cmux_jumper: None,
             cmux_workspaces: std::collections::HashMap::new(),
@@ -133,12 +133,15 @@ impl Collector {
         self
     }
 
-    /// cmux 이벤트 구독을 연결한다. `CmuxSubscriber::spawn()`이 돌려준 채널이다.
-    /// `None`이면(cmux 없음) 레이어 2는 계속 비활성으로 남는다.
+    /// cmux 이벤트 구독을 연결한다. `CmuxSubscriber::spawn()`/`spawn_one_shot()`이
+    /// 돌려준 값이다. `None`이면(cmux 없음) 레이어 2는 계속 비활성으로 남는다.
+    /// `Collector`가 이 값을 들고 있다가 버려질 때 - 예를 들어 `--json`처럼
+    /// 스냅샷 한 번을 찍고 함수가 끝날 때 - `CmuxSubscriber::drop`이 자식
+    /// 프로세스를 죽인다. 호출부가 따로 기억할 필요가 없다.
     #[allow(dead_code)]
-    pub fn with_cmux(mut self, rx: Option<std::sync::mpsc::Receiver<cmux::CmuxEvent>>) -> Self {
-        self.cmux_linked = rx.is_some();
-        self.cmux_rx = rx;
+    pub fn with_cmux(mut self, subscriber: Option<cmux::CmuxSubscriber>) -> Self {
+        self.cmux_linked = subscriber.is_some();
+        self.cmux_subscriber = subscriber;
         self
     }
 
@@ -171,9 +174,9 @@ impl Collector {
         // cmux 없이 동작하던 상태로 되돌아간다(터미널 중립성).
         let mut cmux_events: Vec<cmux::CmuxEvent> = Vec::new();
         let mut cmux_disconnected = false;
-        if let Some(rx) = self.cmux_rx.as_ref() {
+        if let Some(sub) = self.cmux_subscriber.as_ref() {
             loop {
-                match rx.try_recv() {
+                match sub.rx.try_recv() {
                     Ok(ev) => cmux_events.push(ev),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -184,7 +187,10 @@ impl Collector {
             }
         }
         if cmux_disconnected {
-            self.cmux_rx = None;
+            // 구독 스레드가 죽었다는 뜻이므로 자식도 이미 죽었거나 곧 죽는다 -
+            // 그래도 CmuxSubscriber를 버려 Drop이 확실히 거두게 한다(이미 죽은
+            // 자식을 또 죽이는 것도 안전해야 한다는 요구를 그대로 만족한다).
+            self.cmux_subscriber = None;
             self.cmux_linked = false;
         }
 

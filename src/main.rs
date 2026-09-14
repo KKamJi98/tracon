@@ -109,17 +109,24 @@ fn run_hooks(action: HooksAction) -> anyhow::Result<()> {
 
 fn run_json() -> anyhow::Result<()> {
     // cmux가 없거나 구독이 즉시 죽으면 None이고, 그 아래 나머지는 cmux가 존재한
-    // 적 없는 것처럼 그대로 동작한다 - 레이어 2는 언제나 선택이다.
-    let cmux_rx = crate::collect::cmux::CmuxSubscriber::spawn();
-    let cmux_jumper = cmux_rx.is_some().then(crate::jump::cmux::CmuxJumper::new);
+    // 적 없는 것처럼 그대로 동작한다 - 레이어 2는 언제나 선택이다. `--json`은
+    // 스냅샷 한 번만 찍고 끝나는 호출(예: statusline 폴링)이라 `--reconnect` 없는
+    // `spawn_one_shot()`을 쓴다 - 계속 재연결을 시도하는 구독을 한 번 쓰고
+    // 버릴 이유가 없다.
+    let cmux = crate::collect::cmux::CmuxSubscriber::spawn_one_shot();
+    let cmux_jumper = cmux.is_some().then(crate::jump::cmux::CmuxJumper::new);
     let mut collector = crate::collect::Collector::new(
         Box::new(crate::collect::proc::SysProcessSource::new()),
         crate::config::Thresholds::default(),
     )
     .with_jumpers(vec![Box::new(crate::jump::tmux::TmuxJumper::new())])
-    .with_cmux(cmux_rx)
+    .with_cmux(cmux)
     .with_cmux_jumper(cmux_jumper);
     let snapshot = collector.snapshot(crate::collect::hooksink::now_ms());
+    // 스냅샷을 찍은 즉시 collector를 버려 cmux 구독(있다면)을 명시적으로 끊는다 -
+    // 프로세스 종료에 기대지 않는다. 그러지 않으면 이 호출이 statusline처럼
+    // 몇 초마다 반복될 때마다 cmux 데몬에 자식이 하나씩 쌓인다.
+    drop(collector);
     println!("{}", serde_json::to_string(&snapshot)?);
     Ok(())
 }
