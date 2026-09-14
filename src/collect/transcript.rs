@@ -48,8 +48,36 @@ struct RawEntry {
 struct RawMessage {
     model: Option<String>,
     #[serde(default)]
-    content: Vec<RawBlock>,
+    content: RawContent,
     usage: Option<RawUsage>,
+}
+
+/// `message.content`는 블록 배열일 때도 있고 그냥 문자열일 때도 있다. 한쪽 모양만
+/// 받으면 반대쪽 엔트리는 줄 전체가 역직렬화에 실패해 통째로 버려진다 - 실측
+/// transcript에서 문자열 형태의 `user` 엔트리가 상당수였다.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawContent {
+    Blocks(Vec<RawBlock>),
+    /// 문자열 본문 자체는 쓰지 않는다 - 계층 0은 "사용자 메시지가 마지막"이라는
+    /// 사실만 필요하고, transcript 내용을 화면에 노출하지 않는 것이 설계 비목표다.
+    Text(#[allow(dead_code)] String),
+}
+
+impl Default for RawContent {
+    fn default() -> Self {
+        RawContent::Blocks(Vec::new())
+    }
+}
+
+impl RawContent {
+    /// 문자열 content에는 tool_use/tool_result 블록이 있을 수 없으므로 빈 슬라이스다.
+    fn blocks(&self) -> &[RawBlock] {
+        match self {
+            RawContent::Blocks(blocks) => blocks,
+            RawContent::Text(_) => &[],
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -119,7 +147,7 @@ fn process_line(line: &str, pending: &mut Vec<String>) -> Option<LatestEntry> {
     }
     let message = entry.message?;
 
-    for block in &message.content {
+    for block in message.content.blocks() {
         match block.kind.as_str() {
             "tool_use" => {
                 if let Some(id) = &block.id {
@@ -141,7 +169,7 @@ fn process_line(line: &str, pending: &mut Vec<String>) -> Option<LatestEntry> {
 
     let kind = match (
         entry.kind.as_str(),
-        message.content.first().map(|b| b.kind.as_str()),
+        message.content.blocks().first().map(|b| b.kind.as_str()),
     ) {
         ("assistant", Some("tool_use")) => EntryKind::AssistantToolUse,
         ("assistant", _) => EntryKind::AssistantText,
@@ -301,6 +329,30 @@ mod tests {
         let s = parse_tail(&input).expect("summary");
         assert_eq!(s.last_kind, EntryKind::AssistantText);
         assert_eq!(s.last_ts_ms, 1_789_430_403_000);
+    }
+
+    /// 실측 transcript에서 `user` 엔트리의 `content`는 블록 배열일 때도 있고 그냥
+    /// 문자열일 때도 있다(12개 파일 표본에서 문자열 형태가 348건). 문자열 모양을
+    /// 못 읽으면 사용자 프롬프트가 통째로 사라져 계층 0이 그 세션의 진행을 못 본다.
+    #[test]
+    fn user_entry_with_plain_string_content_is_parsed() {
+        let line = r#"{"type":"user","timestamp":"2026-09-15T00:00:05.000Z","isSidechain":false,"message":{"role":"user","content":"please fix the build"}}"#;
+        let s = parse_tail(line).expect("문자열 content를 가진 user 엔트리도 파싱돼야 한다");
+        assert_eq!(s.last_kind, EntryKind::UserText);
+        assert_eq!(s.last_ts_ms, 1_789_430_405_000);
+    }
+
+    #[test]
+    fn assistant_entry_with_plain_string_content_is_parsed() {
+        let line = r#"{"type":"assistant","timestamp":"2026-09-15T00:00:06.000Z","isSidechain":false,"message":{"model":"claude-opus-5","content":"done"}}"#;
+        let s = parse_tail(line).expect("문자열 content를 가진 assistant 엔트리도 파싱돼야 한다");
+        assert_eq!(s.last_kind, EntryKind::AssistantText);
+    }
+
+    #[test]
+    fn block_array_content_still_parses() {
+        let s = parse_tail(WAITING).expect("summary");
+        assert_eq!(s.last_kind, EntryKind::AssistantText);
     }
 
     #[test]
