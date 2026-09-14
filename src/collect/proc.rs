@@ -14,7 +14,10 @@ pub struct ProcInfo {
     pub tty: Option<String>,
 }
 
-pub trait ProcessSource {
+/// `Send`를 요구하는 이유: Collector가 TUI의 수집 스레드로 통째로 옮겨지므로
+/// (`src/ui/mod.rs`의 `run_tui`), 그 안의 `Box<dyn ProcessSource>`도 스레드 경계를
+/// 넘을 수 있어야 한다.
+pub trait ProcessSource: Send {
     fn list_agents(&mut self) -> Vec<ProcInfo>;
 }
 

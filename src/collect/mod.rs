@@ -227,6 +227,14 @@ impl Collector {
         }
 
         sort_sessions(&mut sessions);
+
+        // `claimed`는 이번 tick에 살아 있는 프로세스가 실제로 가리킨 transcript
+        // 경로만 담는다. 이 tick에서 아무도 가리키지 않은 경로의 tracker/offset은
+        // 여기서 버린다 - 한 번 봤던 세션의 흔적을 영원히 들고 있으면, 초 단위로
+        // 폴링하는 TUI에서 두 맵이 시간이 지날수록 계속 커지는 메모리 누수가 된다.
+        self.trackers.retain(|path, _| claimed.contains(path));
+        self.tailer.retain(&claimed);
+
         Snapshot {
             sessions,
             hooks_installed,
@@ -522,5 +530,43 @@ mod tests {
         // running again instead of still being stuck on the resolved tool_use.
         assert_ne!(second.sessions[0].state, State::WaitingApproval);
         assert_eq!(second.sessions[0].state, State::RunningInference);
+    }
+
+    #[test]
+    fn tracker_and_offset_entries_are_pruned_once_the_process_is_gone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::fs::write(proj.join("u1.jsonl"), "").expect("write");
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc(Some("u1"), "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+
+        let first = c.snapshot(NOW);
+        assert_eq!(first.sessions.len(), 1);
+        // The transcript was resolved this tick, so both maps hold exactly its entry.
+        assert_eq!(c.trackers.len(), 1);
+        assert_eq!(c.tailer.tracked_count(), 1);
+
+        // The process behind that session is gone from now on - a TUI polling once a
+        // second for hours will keep seeing this on every future tick unless the
+        // collector prunes it.
+        c.procs = Box::new(FakeProcs(vec![]));
+        let second = c.snapshot(NOW + 1_000);
+
+        assert!(second.sessions.is_empty());
+        assert_eq!(
+            c.trackers.len(),
+            0,
+            "tracker entry for the dead session must be dropped"
+        );
+        assert_eq!(
+            c.tailer.tracked_count(),
+            0,
+            "tailer offset for the dead session must be dropped"
+        );
     }
 }

@@ -117,6 +117,5 @@ fn run_json() -> anyhow::Result<()> {
 }
 
 fn run_tui() -> anyhow::Result<()> {
-    println!("TUI not built yet");
-    Ok(())
+    crate::ui::run_tui()
 }

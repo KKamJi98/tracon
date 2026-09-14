@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,18 @@ impl Tailer {
         let mut buf = Vec::with_capacity((len - start) as usize);
         file.take(len - start).read_to_end(&mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// `live`에 없는 경로의 offset을 잊는다. 더 이상 어떤 프로세스도 가리키지 않는
+    /// transcript를 위해 오프셋을 무한정 들고 있지 않기 위함이다 - 장시간 폴링하는
+    /// TUI에서 누적되는 세션마다 이 맵이 하나씩 늘어나면 메모리 누수가 된다.
+    pub fn retain(&mut self, live: &HashSet<PathBuf>) {
+        self.offsets.retain(|path, _| live.contains(path));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_count(&self) -> usize {
+        self.offsets.len()
     }
 }
 
@@ -106,5 +118,23 @@ mod tests {
         assert!(t
             .read_new(std::path::Path::new("/nonexistent/x.jsonl"))
             .is_err());
+    }
+
+    #[test]
+    fn retain_drops_offsets_for_paths_not_in_the_live_set() {
+        let dir = tempfile::tempdir().expect("dir");
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        write(&a, "line1\n");
+        write(&b, "line1\n");
+        let mut t = Tailer::new();
+        let _ = t.read_new(&a).expect("read a");
+        let _ = t.read_new(&b).expect("read b");
+        assert_eq!(t.tracked_count(), 2);
+
+        let live: std::collections::HashSet<std::path::PathBuf> = [a.clone()].into();
+        t.retain(&live);
+
+        assert_eq!(t.tracked_count(), 1);
     }
 }

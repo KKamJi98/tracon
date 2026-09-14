@@ -6,8 +6,18 @@ mod table;
 pub(crate) mod theme;
 
 use crate::json::Snapshot;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::Frame;
+use ratatui::{Frame, Terminal};
+use std::io::{stdout, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 #[allow(dead_code)]
 pub fn render(frame: &mut Frame, snap: &Snapshot, selected: usize) {
@@ -42,6 +52,159 @@ pub fn ctx_bar(pct: u32) -> String {
         bar.push(if i < filled { '#' } else { '.' });
     }
     bar
+}
+
+/// 키 입력이 요청하는 동작. `Jump`/`CopyResume`/`Kill`은 여기서 반환만 되고,
+/// 실제 배선은 다음 task에서 한다 - 이 task에서는 순수하게 inert 하다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+    Jump(usize),
+    CopyResume(usize),
+    Kill(usize),
+    ToggleSort,
+}
+
+/// TUI의 순수 상태. 렌더링·IO와 분리해 두어야 `on_key`/`apply`를 헤드리스로
+/// 테스트할 수 있다.
+pub struct App {
+    pub snapshot: Snapshot,
+    pub selected: usize,
+}
+
+impl App {
+    pub fn new(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot,
+            selected: 0,
+        }
+    }
+
+    pub fn selected_key(&self) -> Option<&crate::model::SessionKey> {
+        self.snapshot.sessions.get(self.selected).map(|s| &s.key)
+    }
+
+    /// 새 스냅샷을 받아도 사용자가 보던 세션에 선택을 유지한다.
+    pub fn apply(&mut self, snapshot: Snapshot) {
+        let prev = self.selected_key().cloned();
+        self.snapshot = snapshot;
+        self.selected = prev
+            .and_then(|k| self.snapshot.sessions.iter().position(|s| s.key == k))
+            .unwrap_or(0);
+    }
+
+    pub fn on_key(&mut self, code: KeyCode) -> Action {
+        let len = self.snapshot.sessions.len();
+        if len == 0 {
+            return match code {
+                KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+                _ => Action::None,
+            };
+        }
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.selected = (self.selected + 1).min(len - 1);
+                Action::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Enter => Action::Jump(self.selected),
+            KeyCode::Char('r') => Action::CopyResume(self.selected),
+            KeyCode::Char('x') => Action::Kill(self.selected),
+            KeyCode::Char('s') => Action::ToggleSort,
+            _ => Action::None,
+        }
+    }
+}
+
+/// 패닉 훅을 설치한다. 기본 훅이 메시지를 찍기 전에 터미널을 raw mode/alternate
+/// screen에서 먼저 복구해, 어떤 경로로 죽어도 사용자의 터미널이 먹통이 되지 않게 한다.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        default_hook(info);
+    }));
+}
+
+fn init_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(out))?)
+}
+
+/// alternate screen을 떠나고 raw mode를 해제한다. 정상 종료, 에러 종료, 패닉
+/// 세 경로 모두 이 함수 하나로 복구한다.
+fn restore_terminal() -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// 수집 스레드를 띄우고 렌더/키 루프를 돈다. 인자 없이 실행했을 때의 진입점.
+pub fn run_tui() -> anyhow::Result<()> {
+    install_panic_hook();
+    let mut terminal = init_terminal()?;
+
+    let mut collector = crate::collect::Collector::new(
+        Box::new(crate::collect::proc::SysProcessSource::new()),
+        crate::config::Thresholds::default(),
+    );
+    // 첫 프레임은 백그라운드 스레드의 1초 tick을 기다리지 않고 즉시 그린다.
+    let mut app = App::new(collector.snapshot(crate::collect::hooksink::now_ms()));
+
+    let (tx, rx) = mpsc::channel::<Snapshot>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let collector_stop = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !collector_stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+            if collector_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let snap = collector.snapshot(crate::collect::hooksink::now_ms());
+            // 수신자가 이미 사라졌으면(UI가 종료 중) 조용히 스레드를 끝낸다.
+            if tx.send(snap).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = event_loop(&mut terminal, &mut app, &rx);
+    stop.store(true, Ordering::Relaxed);
+    // 수집 스레드는 join하지 않는다 - 최악의 경우도 1초 sleep 중 하나뿐이고,
+    // 프로세스가 곧 끝나므로 join으로 종료를 늦출 이유가 없다.
+    let restore_result = restore_terminal();
+    result.and(restore_result)
+}
+
+/// 100ms마다 키를 폴링하고, 채널에 새 스냅샷이 있으면 반영한 뒤 매 tick 다시 그린다.
+/// 수집 스레드가 느려져도 이 루프는 채널을 기다리지 않으므로 키 입력이 막히지 않는다.
+fn event_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mpsc::Receiver<Snapshot>,
+) -> anyhow::Result<()> {
+    loop {
+        terminal.draw(|f| render(f, &app.snapshot, app.selected))?;
+
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press && app.on_key(key.code) == Action::Quit {
+                    return Ok(());
+                }
+            }
+        }
+
+        while let Ok(snap) = rx.try_recv() {
+            app.apply(snap);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +330,120 @@ pub(crate) mod tests {
             .collect::<String>();
         assert!(text.contains("hooks on"));
         assert!(text.contains("cmux linked"));
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    fn app_with(n: usize) -> App {
+        App::new(crate::json::Snapshot {
+            sessions: (0..n).map(|_| super::tests::sample_session()).collect(),
+            hooks_installed: false,
+            cmux_linked: false,
+            generated_at_ms: 0,
+        })
+    }
+
+    #[test]
+    fn j_and_k_move_selection_within_bounds() {
+        let mut app = app_with(3);
+        assert_eq!(app.selected, 0);
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.selected, 1);
+        app.on_key(KeyCode::Char('k'));
+        app.on_key(KeyCode::Char('k'));
+        assert_eq!(app.selected, 0);
+        for _ in 0..10 {
+            app.on_key(KeyCode::Char('j'));
+        }
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn q_quits() {
+        let mut app = app_with(1);
+        assert_eq!(app.on_key(KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn enter_requests_jump_for_selected_row() {
+        let mut app = app_with(2);
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.on_key(KeyCode::Enter), Action::Jump(1));
+    }
+
+    #[test]
+    fn keys_on_empty_list_do_not_panic() {
+        let mut app = app_with(0);
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert_eq!(app.on_key(KeyCode::Char('j')), Action::None);
+    }
+
+    #[test]
+    fn new_snapshot_keeps_selection_on_same_session() {
+        let mut app = app_with(3);
+        app.on_key(KeyCode::Char('j'));
+        let selected_uuid = app.selected_key().map(|k| k.uuid.clone());
+        let mut snap = app.snapshot.clone();
+        snap.sessions.rotate_left(1);
+        app.apply(snap);
+        assert_eq!(app.selected_key().map(|k| k.uuid.clone()), selected_uuid);
+    }
+
+    #[test]
+    fn r_requests_copy_resume_and_x_requests_kill_but_neither_mutates_state() {
+        let mut app = app_with(2);
+        assert_eq!(app.on_key(KeyCode::Char('r')), Action::CopyResume(0));
+        assert_eq!(app.on_key(KeyCode::Char('x')), Action::Kill(0));
+        assert_eq!(app.on_key(KeyCode::Char('s')), Action::ToggleSort);
+        // 이 task에서는 세 Action 모두 inert 하다 - 선택이나 스냅샷을 바꾸지 않는다.
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.snapshot.sessions.len(), 2);
+    }
+
+    /// Task 10의 Collector가 실제로 만든 Snapshot이 Task 11의 render를 그대로
+    /// 통과하는지 확인한다 - 두 task가 이 task에서 실제로 이어붙는지 증명하는 것이
+    /// 목적이라 App을 거치지 않고 render를 직접 호출한다.
+    #[test]
+    fn a_real_collector_snapshot_renders_through_the_real_pipeline() {
+        struct FakeProcs(Vec<crate::collect::proc::ProcInfo>);
+        impl crate::collect::proc::ProcessSource for FakeProcs {
+            fn list_agents(&mut self) -> Vec<crate::collect::proc::ProcInfo> {
+                self.0.clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let proc = crate::collect::proc::ProcInfo {
+            pid: 123,
+            provider: crate::model::Provider::Claude,
+            session_id: Some("u1".into()),
+            cwd: Some(std::path::PathBuf::from("/home/dev/app")),
+            cpu: 0.0,
+            started_at_ms: 0,
+            tty: None,
+        };
+        let mut collector = crate::collect::Collector::new(
+            Box::new(FakeProcs(vec![proc])),
+            crate::config::Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+        let snap = collector.snapshot(1_000);
+        assert_eq!(snap.sessions.len(), 1);
+
+        let backend = ratatui::backend::TestBackend::new(90, 14);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| render(f, &snap, 0)).expect("draw");
+        let text = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("app"));
     }
 }
