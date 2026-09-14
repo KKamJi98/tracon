@@ -15,6 +15,10 @@ pub struct Collector {
     procs: Box<dyn ProcessSource>,
     cfg: Thresholds,
     tailer: tail::Tailer,
+    // transcript 경로별 누적 파서 상태. Tailer가 델타만 돌려주므로, 새로 읽을 바이트가
+    // 없는 tick에도 세션의 진짜 상태와 마지막 변경 시각을 잃지 않으려면 세션마다
+    // 하나씩 들고 있어야 한다.
+    trackers: std::collections::HashMap<PathBuf, transcript::TranscriptTracker>,
     projects_root: PathBuf,
     sink_dir: PathBuf,
 }
@@ -86,6 +90,7 @@ impl Collector {
             procs,
             cfg,
             tailer: tail::Tailer::new(),
+            trackers: std::collections::HashMap::new(),
             projects_root: home.join(".claude/projects"),
             sink_dir: hooksink::sink_dir(),
         }
@@ -134,11 +139,12 @@ impl Collector {
 
         // 2단계: session_id를 모르는 프로세스는 같은 cwd에서 아직 배정되지 않은
         // transcript 중 가장 최근 것을 하나씩 가져간다. 남은 transcript가 없어도
-        // 세션을 숨기지 않고 Unknown으로 띄운다.
-        for p in &live {
-            if p.session_id.is_some() {
-                continue;
-            }
+        // 세션을 숨기지 않고 Unknown으로 띄운다. pid로 먼저 정렬해 배정이 live 벡터의
+        // 원래 순서(sysinfo의 HashMap 순회 등, 보장되지 않는다)에 좌우되지 않게 한다.
+        let mut unclaimed_procs: Vec<&ProcInfo> =
+            live.iter().filter(|p| p.session_id.is_none()).collect();
+        unclaimed_procs.sort_by_key(|p| p.pid);
+        for p in unclaimed_procs {
             let Some(cwd) = p.cwd.as_ref() else {
                 continue;
             };
@@ -170,11 +176,15 @@ impl Collector {
 
         let mut sessions = Vec::new();
         for (key, (p, path)) in &by_key {
-            let chunk = match path {
-                Some(path) => self.tailer.read_new(path).unwrap_or_default(),
-                None => String::new(),
+            let summary = match path {
+                Some(path) => {
+                    let chunk = self.tailer.read_new(path).unwrap_or_default();
+                    let tracker = self.trackers.entry(path.clone()).or_default();
+                    tracker.apply(&chunk);
+                    tracker.summary()
+                }
+                None => None,
             };
-            let summary = transcript::parse_tail(&chunk);
 
             let (state0, conf0) = layer0::infer(summary.as_ref(), true, p.cpu, now_ms, &self.cfg);
             let mut observations = vec![Observation {
@@ -438,5 +448,79 @@ mod tests {
         assert_eq!(snap.sessions.len(), 1);
         assert_eq!(snap.sessions[0].state, State::Unknown);
         assert_eq!(snap.sessions[0].pid, Some(400));
+    }
+
+    #[test]
+    fn snapshot_state_is_stable_across_repeated_polls_with_no_new_bytes() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let line = r#"{"type":"assistant","timestamp":"2027-01-15T00:00:00.000Z","cwd":"/home/dev/app","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":0,"cache_read_input_tokens":100000,"cache_creation_input_tokens":0}}}"#;
+        std::fs::write(proj.join("u1.jsonl"), format!("{line}\n")).expect("write");
+
+        let ts = crate::collect::transcript::parse_tail(line)
+            .expect("tail")
+            .last_ts_ms;
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc(Some("u1"), "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+
+        let first = c.snapshot(ts + 5_000);
+        // No bytes were appended between polls - Tailer hands back an empty delta on
+        // this second call. Without the per-transcript tracker this used to reset the
+        // session to Unknown and stamp last_change_ms with the current clock.
+        let second = c.snapshot(ts + 10_000);
+
+        assert_eq!(first.sessions[0].state, State::WaitingInput);
+        assert_eq!(second.sessions[0].state, first.sessions[0].state);
+        assert_eq!(
+            second.sessions[0].last_change_ms,
+            first.sessions[0].last_change_ms
+        );
+    }
+
+    #[test]
+    fn pending_tool_use_resolves_once_the_matching_tool_result_arrives_in_a_later_poll() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+
+        let tool_use = r#"{"type":"assistant","timestamp":"2027-01-15T00:00:00.000Z","cwd":"/home/dev/app","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#;
+        std::fs::write(proj.join("u1.jsonl"), format!("{tool_use}\n")).expect("write first chunk");
+        let t1_ms = crate::collect::transcript::parse_tail(tool_use)
+            .expect("tail")
+            .last_ts_ms;
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc(Some("u1"), "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+
+        // 40s later, still no cpu and an unmatched tool_use - infer() suspects the
+        // session is stuck waiting on an approval prompt.
+        let first = c.snapshot(t1_ms + 40_000);
+        assert_eq!(first.sessions[0].state, State::WaitingApproval);
+
+        // The matching tool_result arrives in a later delta, appended to the same file.
+        let tool_result = r#"{"type":"user","timestamp":"2027-01-15T00:00:50.000Z","isSidechain":false,"message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(proj.join("u1.jsonl"))
+                .expect("open for append");
+            writeln!(f, "{tool_result}").expect("append tool_result");
+        }
+        let t2_ms =
+            crate::collect::transcript::parse_ts_ms("2027-01-15T00:00:50.000Z").expect("parse ts");
+
+        let second = c.snapshot(t2_ms + 5_000);
+        // pending dropped to zero across the chunk boundary - the session reads as
+        // running again instead of still being stuck on the resolved tool_use.
+        assert_ne!(second.sessions[0].state, State::WaitingApproval);
+        assert_eq!(second.sessions[0].state, State::RunningInference);
     }
 }

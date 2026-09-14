@@ -35,8 +35,16 @@ impl Snapshot {
 }
 
 /// 빨강 -> 초록 -> 무색 -> dim, 같은 그룹 안에서는 오래 기다린 순.
+/// 상태와 마지막 변경 시각까지 같으면(예: 같은 tick에 기록된 두 세션) uuid로 마지막
+/// 판가름을 낸다 - HashMap 순회에서 나온 입력이 poll마다 순서를 바꾸지 않도록.
 pub fn sort_sessions(sessions: &mut [Session]) {
-    sessions.sort_by_key(|s| (s.state.rank(), s.last_change_ms));
+    sessions.sort_by(|a, b| {
+        (a.state.rank(), a.last_change_ms, &a.key.uuid).cmp(&(
+            b.state.rank(),
+            b.last_change_ms,
+            &b.key.uuid,
+        ))
+    });
 }
 
 #[cfg(test)]
@@ -44,11 +52,11 @@ mod tests {
     use super::*;
     use crate::model::*;
 
-    fn session(state: State, last_change: i64) -> Session {
+    fn session_with(uuid: &str, state: State, last_change: i64) -> Session {
         Session {
             key: SessionKey {
                 provider: Provider::Claude,
-                uuid: "u".into(),
+                uuid: uuid.into(),
             },
             state,
             source: Source::Layer0Inferred,
@@ -65,6 +73,10 @@ mod tests {
         }
     }
 
+    fn session(state: State, last_change: i64) -> Session {
+        session_with("u", state, last_change)
+    }
+
     #[test]
     fn sorts_red_first_then_oldest_wait() {
         let mut v = vec![
@@ -78,6 +90,17 @@ mod tests {
         assert_eq!(v[1].state, State::WaitingInput);
         assert_eq!(v[2].state, State::RunningTool);
         assert_eq!(v[3].state, State::Idle);
+    }
+
+    #[test]
+    fn ties_on_state_and_last_change_break_by_uuid() {
+        let mut v = vec![
+            session_with("b", State::WaitingInput, 10),
+            session_with("a", State::WaitingInput, 10),
+        ];
+        sort_sessions(&mut v);
+        assert_eq!(v[0].key.uuid, "a");
+        assert_eq!(v[1].key.uuid, "b");
     }
 
     #[test]
