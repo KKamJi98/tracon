@@ -16,7 +16,7 @@ const EVENTS: [&str; 9] = [
     "SessionEnd",
 ];
 
-const MARKER: &str = "tracon hook-event";
+const MARKER: &str = "hook-event --provider";
 
 pub fn hook_block(exe: &str) -> Value {
     let mut map = serde_json::Map::new();
@@ -82,7 +82,10 @@ pub fn install(path: &Path, exe: &str) -> anyhow::Result<()> {
 pub fn uninstall(path: &Path) -> anyhow::Result<()> {
     backup(path)?;
     let mut settings = load(path)?;
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+    if let Some(hooks_value) = settings.get_mut("hooks") {
+        let hooks = hooks_value
+            .as_object_mut()
+            .context("hooks is not an object")?;
         for (_, list) in hooks.iter_mut() {
             if let Some(arr) = list.as_array_mut() {
                 arr.retain(|e| !is_ours(e));
@@ -188,6 +191,51 @@ mod tests {
         assert!(
             cmd.contains(MARKER),
             "command {cmd} does not contain MARKER {MARKER}"
+        );
+    }
+
+    #[test]
+    fn uninstall_errors_on_malformed_hooks() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        let original = r#"{"hooks":"not-an-object"}"#;
+        std::fs::write(&p, original).expect("seed");
+        let result = uninstall(&p);
+        assert!(
+            result.is_err(),
+            "expected uninstall to error on malformed hooks"
+        );
+        let raw = std::fs::read_to_string(&p).expect("read");
+        assert_eq!(raw, original, "file must be untouched on error");
+    }
+
+    #[test]
+    fn uninstall_succeeds_when_hooks_absent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        std::fs::write(&p, "{}").expect("seed");
+        uninstall(&p).expect("uninstall should be a no-op success when hooks key is absent");
+    }
+
+    #[test]
+    fn install_and_uninstall_work_with_exe_name_not_containing_tracon() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        std::fs::write(&p, "{}").expect("seed");
+        let exe = "/usr/local/bin/tc";
+        install(&p, exe).expect("first install");
+        install(&p, exe).expect("second install");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&p).expect("read")).expect("json");
+        for ev in EVENTS {
+            let arr = v["hooks"][ev].as_array().expect("array");
+            assert_eq!(arr.len(), 1, "expected exactly one entry for {ev}");
+        }
+        uninstall(&p).expect("uninstall");
+        let raw = std::fs::read_to_string(&p).expect("read");
+        assert!(
+            !raw.contains(exe),
+            "uninstall must remove the tc-installed hooks"
         );
     }
 }
