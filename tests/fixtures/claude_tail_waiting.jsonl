@@ -1,0 +1,4 @@
+{"type":"system","subtype":"hook","timestamp":"2026-09-15T00:00:00.000Z"}
+{"type":"user","timestamp":"2026-09-15T00:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]}}
+{"type":"last-prompt","timestamp":"2026-09-15T00:00:02.000Z"}
+{"type":"assistant","timestamp":"2026-09-15T00:00:03.000Z","cwd":"/home/dev/project-a","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"cache_read_input_tokens":40000,"cache_creation_input_tokens":500}}}
