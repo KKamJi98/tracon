@@ -411,10 +411,16 @@ impl Collector {
                 confidence: conf0,
                 observed_at: now_ms,
             }];
+            // transcript가 훅 기록보다 나중에 움직였으면 그 기록은 낡은 것이다.
+            // 훅 기록은 파일로 남으므로 - `hooks uninstall` 이후나 SessionEnd 없이
+            // 세션이 죽은 뒤에도 - 이 검사가 없으면 살아 있는 세션이 마지막 훅
+            // 상태에 영원히 고정된다.
+            let transcript_ts = summary.as_ref().map(|s| s.last_ts_ms).unwrap_or(i64::MIN);
             observations.extend(
                 sink_records
                     .iter()
                     .filter(|r| &r.key == key)
+                    .filter(|r| r.occurred_at >= transcript_ts)
                     .filter_map(|r| r.to_observation()),
             );
             if let Some(cx) = cmux_by_key.get(key) {
@@ -505,6 +511,11 @@ impl Collector {
         // 같은 이유로, 더는 없는 세션의 workspace_id를 무한정 들고 있지 않는다.
         self.cmux_workspaces
             .retain(|key, _| by_key.contains_key(key));
+        // 훅 기록 파일도 같은 이유로 정리한다. 살아 있는 프로세스가 아무도 가리키지
+        // 않은 세션의 기록은 다시 쓰일 일이 없다.
+        let live_uuids: std::collections::HashSet<String> =
+            by_key.keys().map(|k| k.uuid.clone()).collect();
+        hooksink::prune(&self.sink_dir, &live_uuids);
 
         Snapshot {
             sessions,
@@ -622,6 +633,90 @@ mod tests {
         assert_eq!(snap.sessions[0].state, State::WaitingApproval);
         assert_eq!(snap.sessions[0].source, crate::model::Source::Layer1Hook);
         assert!(snap.hooks_installed);
+    }
+
+    /// 훅 기록은 파일에 남아 있는 한 영원히 이긴다. `hooks uninstall` 이후나
+    /// SessionEnd 없이 훅이 죽은 뒤에도, 살아 있는 세션이 마지막 훅 상태에 고정돼
+    /// 실제로는 사용자를 기다리는데 초록색 "running"으로 남는다. transcript가 그
+    /// 기록보다 나중에 움직였으면 훅 기록은 낡은 것이다.
+    #[test]
+    fn hook_record_older_than_the_transcript_is_ignored() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let line = r#"{"type":"assistant","timestamp":"2027-01-15T00:00:00.000Z","cwd":"/home/dev/app","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        std::fs::write(proj.join("u1.jsonl"), format!("{line}\n")).expect("write");
+        let ts = crate::collect::transcript::parse_tail(line)
+            .expect("tail")
+            .last_ts_ms;
+
+        let sink = dir.path().join("sink");
+        crate::collect::hooksink::record_event(
+            &sink,
+            &crate::collect::hooksink::SinkRecord {
+                key: crate::model::SessionKey {
+                    provider: Provider::Claude,
+                    uuid: "u1".into(),
+                },
+                event: crate::model::HookEvent::PreToolUse,
+                occurred_at: ts - 10_000,
+                cwd: None,
+                pid: None,
+            },
+        )
+        .expect("record");
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc(Some("u1"), "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf())
+        .with_sink_dir(sink);
+        let snap = c.snapshot(ts + 5_000);
+
+        assert_eq!(snap.sessions[0].state, State::WaitingInput);
+        assert_eq!(
+            snap.sessions[0].source,
+            crate::model::Source::Layer0Inferred
+        );
+    }
+
+    /// 살아 있는 프로세스가 아무도 가리키지 않은 세션의 훅 기록 파일은 지운다.
+    /// 그러지 않으면 sink 디렉터리가 무한히 자라고(tick마다 전부 읽는다), `hooks on`
+    /// 배지도 기록이 한 번이라도 생긴 뒤로는 영원히 켜진 채로 남는다.
+    #[test]
+    fn sink_files_for_sessions_no_live_process_resolved_to_are_pruned() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sink = dir.path().join("sink");
+        for uuid in ["u1", "ghost"] {
+            crate::collect::hooksink::record_event(
+                &sink,
+                &crate::collect::hooksink::SinkRecord {
+                    key: crate::model::SessionKey {
+                        provider: Provider::Claude,
+                        uuid: uuid.into(),
+                    },
+                    event: crate::model::HookEvent::Stop,
+                    occurred_at: NOW - 1_000,
+                    cwd: None,
+                    pid: None,
+                },
+            )
+            .expect("record");
+        }
+        assert_eq!(crate::collect::hooksink::read_all(&sink).len(), 2);
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc(Some("u1"), "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().join("projects"))
+        .with_sink_dir(sink.clone());
+        let _ = c.snapshot(NOW);
+
+        let left = crate::collect::hooksink::read_all(&sink);
+        assert_eq!(left.len(), 1, "살아 있는 세션의 기록만 남아야 한다");
+        assert_eq!(left[0].key.uuid, "u1");
     }
 
     #[test]

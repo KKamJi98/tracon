@@ -57,6 +57,30 @@ pub fn read_all(dir: &Path) -> Vec<SinkRecord> {
         .collect()
 }
 
+/// `live`에 없는 세션의 기록 파일을 지운다. `Collector`의 tracker/offset 정리와
+/// 같은 이유다 - 아무 프로세스도 가리키지 않게 된 세션의 기록을 영원히 들고 있으면
+/// 초 단위로 폴링하는 TUI에서 tick마다 읽는 파일 수가 무한정 늘고, `hooks on`
+/// 배지도 기록이 한 번 생긴 뒤로는 영원히 켜진 채로 남는다.
+pub fn prune(dir: &Path, live: &std::collections::HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let live_names: std::collections::HashSet<String> = live.iter().map(|u| sanitize(u)).collect();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        // `.tmp` 조각과 cmux 커서 파일은 확장자가 달라 여기서 걸러진다.
+        if path.extension().map(|x| x != "json").unwrap_or(true) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !live_names.contains(stem) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 fn sanitize(uuid: &str) -> String {
     uuid.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -178,6 +202,37 @@ mod tests {
         let all = read_all(dir.path());
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].event, HookEvent::Stop);
+    }
+
+    #[test]
+    fn prune_removes_only_files_outside_the_live_set() {
+        let dir = tempfile::tempdir().expect("dir");
+        for uuid in ["alive", "gone"] {
+            record_event(
+                dir.path(),
+                &SinkRecord {
+                    key: crate::model::SessionKey {
+                        provider: Provider::Claude,
+                        uuid: uuid.into(),
+                    },
+                    event: HookEvent::Stop,
+                    occurred_at: 1,
+                    cwd: None,
+                    pid: None,
+                },
+            )
+            .expect("write");
+        }
+        let cursor = dir.path().join("cmux.cursor");
+        std::fs::write(&cursor, "42").expect("cursor");
+
+        let live: std::collections::HashSet<String> = ["alive".to_string()].into();
+        prune(dir.path(), &live);
+
+        let all = read_all(dir.path());
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].key.uuid, "alive");
+        assert!(cursor.exists(), "json이 아닌 파일은 건드리지 않는다");
     }
 
     #[test]
