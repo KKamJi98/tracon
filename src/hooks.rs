@@ -38,14 +38,60 @@ fn load(path: &Path) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+const BACKUP_INFIX: &str = ".bak-";
+
 fn backup(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
     let stamp = crate::collect::hooksink::now_ms();
-    let dest = path.with_extension(format!("json.bak-{stamp}"));
-    std::fs::copy(path, dest)?;
+    let dest = path.with_extension(format!("json{BACKUP_INFIX}{stamp}"));
+    std::fs::copy(path, &dest)?;
+    prune_backups(path, &dest);
     Ok(())
+}
+
+/// 방금 만든 백업 하나만 남기고 이전 백업을 지운다. 설치와 제거 때마다 하나씩
+/// 쌓이면 사용자의 `~/.claude`가 아무도 치우지 않는 백업으로 덮인다.
+fn prune_backups(path: &Path, keep: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{name}{BACKUP_INFIX}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if entry.path() == keep {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 임시 파일에 쓴 뒤 rename한다. 같은 디렉터리 안의 rename은 원자적이라, 쓰는
+/// 도중에 죽어도 사용자의 settings가 반쯤 쓰인 채로 남지 않는다.
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings.local.json".to_string());
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(())
+}
+
+/// `cargo run`으로 실행하면 `current_exe()`가 `target/debug/tracon`을 가리킨다.
+/// 그 경로를 settings에 박아 두면 `cargo clean` 한 번에 모든 claude 세션의 훅이
+/// 실패한다. 조용히 망가지느니 설치를 거부한다.
+fn is_build_artifact(exe: &str) -> bool {
+    Path::new(exe)
+        .components()
+        .any(|c| c.as_os_str() == "target")
 }
 
 fn is_ours(entry: &Value) -> bool {
@@ -55,6 +101,14 @@ fn is_ours(entry: &Value) -> bool {
 }
 
 pub fn install(path: &Path, exe: &str) -> anyhow::Result<()> {
+    if is_build_artifact(exe) {
+        anyhow::bail!(
+            "빌드 산출물 경로라 설치하지 않습니다: {exe}\n\
+             이 경로는 `cargo clean` 한 번에 사라지고, 그 뒤로는 모든 claude 세션에서 \
+             훅이 실패합니다. 바이너리를 먼저 설치한 뒤(cargo install --git \
+             https://github.com/KKamJi98/tracon) 설치된 tracon으로 다시 실행하세요."
+        );
+    }
     backup(path)?;
     let mut settings = load(path)?;
     let block = hook_block(exe);
@@ -73,7 +127,7 @@ pub fn install(path: &Path, exe: &str) -> anyhow::Result<()> {
             arr.push(ours.clone());
         }
     }
-    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)?;
+    write_atomic(path, &serde_json::to_vec_pretty(&settings)?)?;
     Ok(())
 }
 
@@ -91,7 +145,7 @@ pub fn uninstall(path: &Path) -> anyhow::Result<()> {
         }
         hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
     }
-    std::fs::write(path, serde_json::to_vec_pretty(&settings)?)?;
+    write_atomic(path, &serde_json::to_vec_pretty(&settings)?)?;
     Ok(())
 }
 
@@ -142,6 +196,86 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .collect();
         assert_eq!(backups.len(), 1);
+    }
+
+    fn backup_names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bak-"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `cargo run`으로 설치하면 `current_exe()`가 `target/debug/tracon`을 가리킨다.
+    /// 그 경로가 settings에 박히면 `cargo clean` 한 번에 모든 claude 세션에서 훅이
+    /// 실패한다. 조용히 망가지느니 설치를 거부한다.
+    #[test]
+    fn install_refuses_an_exe_inside_a_target_directory() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        std::fs::write(&p, "{}").expect("seed");
+
+        let err = install(&p, "/home/dev/tracon/target/debug/tracon")
+            .expect_err("빌드 산출물 경로는 거부해야 한다");
+        assert!(err.to_string().contains("target"), "메시지: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).expect("read"),
+            "{}",
+            "거부된 설치는 settings를 건드리지 않는다"
+        );
+        assert!(
+            backup_names(dir.path()).is_empty(),
+            "거부된 설치는 백업도 남기지 않는다"
+        );
+    }
+
+    #[test]
+    fn install_keeps_only_the_most_recent_backup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        std::fs::write(&p, "{}").expect("seed");
+        std::fs::write(dir.path().join("settings.local.json.bak-1"), "old").expect("old backup 1");
+        std::fs::write(dir.path().join("settings.local.json.bak-2"), "old").expect("old backup 2");
+
+        install(&p, "/usr/local/bin/tracon").expect("install");
+
+        let names = backup_names(dir.path());
+        assert_eq!(names.len(), 1, "백업은 최신 하나만 남는다: {names:?}");
+        assert!(!names[0].ends_with(".bak-1") && !names[0].ends_with(".bak-2"));
+    }
+
+    #[test]
+    fn uninstall_keeps_only_the_most_recent_backup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        std::fs::write(&p, "{}").expect("seed");
+        std::fs::write(dir.path().join("settings.local.json.bak-1"), "old").expect("old backup");
+
+        uninstall(&p).expect("uninstall");
+
+        assert_eq!(backup_names(dir.path()).len(), 1);
+    }
+
+    /// settings 쓰기는 임시 파일 + rename이라, 쓰다 죽어도 반쯤 쓰인 파일이 남지
+    /// 않는다. 성공 경로에서도 임시 파일이 남으면 안 된다.
+    #[test]
+    fn install_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("settings.local.json");
+        std::fs::write(&p, "{}").expect("seed");
+        install(&p, "/usr/local/bin/tracon").expect("install");
+        uninstall(&p).expect("uninstall");
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "임시 파일이 남았다: {leftovers:?}");
     }
 
     #[test]
