@@ -61,17 +61,31 @@ fn main() -> anyhow::Result<()> {
 
 /// 설치된 훅이 호출하는 경로. stdin을 읽어 이벤트를 기록만 하고,
 /// 어떤 경우에도 0으로 종료한다 - 실패가 에이전트를 막으면 안 된다.
-fn run_hook_event(_provider: &str) -> anyhow::Result<()> {
+///
+/// stdin 파싱은 지금 유일하게 알려진 모양(claude 훅 stdin)을 그대로 쓴다 - codex
+/// 쪽 훅 설치(Task 15 Step 5)는 이번 버전에서 빠졌으므로 codex가 실제로 이 경로를
+/// 호출할 일은 아직 없다. 다만 `--provider`를 무시하고 항상 `Provider::Claude`로
+/// 기록하던 것은 Task 9부터 있던 known gap이었으므로, 기록되는 키의 provider만은
+/// 호출부가 넘긴 값을 따르게 고친다.
+fn run_hook_event(provider: &str) -> anyhow::Result<()> {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return Ok(());
     }
-    let Some(record) = crate::collect::hooksink::event_from_claude_hook(&input) else {
+    let Some(mut record) = crate::collect::hooksink::event_from_claude_hook(&input) else {
         return Ok(());
     };
+    record.key.provider = parse_provider(provider);
     let dir = crate::collect::hooksink::sink_dir();
     let _ = crate::collect::hooksink::record_event(&dir, &record);
     Ok(())
+}
+
+fn parse_provider(s: &str) -> crate::model::Provider {
+    match s {
+        "codex" => crate::model::Provider::Codex,
+        _ => crate::model::Provider::Claude,
+    }
 }
 
 fn settings_path() -> anyhow::Result<std::path::PathBuf> {
