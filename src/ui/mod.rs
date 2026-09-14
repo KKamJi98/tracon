@@ -138,9 +138,18 @@ fn init_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
+/// 실제 복구 작업이 이미 끝났는지 표시한다. 패닉 훅(수집 스레드에서 죽을 수도
+/// 있다)과 `run_tui`의 정상 종료 경로가 둘 다 `restore_terminal`을 부를 수
+/// 있으므로, 두 번째 호출이 raw mode/alternate screen을 다시 건드리지 않게 한다.
+static TERMINAL_RESTORED: AtomicBool = AtomicBool::new(false);
+
 /// alternate screen을 떠나고 raw mode를 해제한다. 정상 종료, 에러 종료, 패닉
-/// 세 경로 모두 이 함수 하나로 복구한다.
+/// 세 경로 모두 이 함수 하나로 복구한다. 두 번 불러도 안전하다 - 실제 복구는
+/// 프로세스당 한 번만 수행된다.
 fn restore_terminal() -> anyhow::Result<()> {
+    if TERMINAL_RESTORED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
     disable_raw_mode()?;
     execute!(stdout(), LeaveAlternateScreen)?;
     Ok(())
@@ -180,7 +189,42 @@ pub fn run_tui() -> anyhow::Result<()> {
     // 수집 스레드는 join하지 않는다 - 최악의 경우도 1초 sleep 중 하나뿐이고,
     // 프로세스가 곧 끝나므로 join으로 종료를 늦출 이유가 없다.
     let restore_result = restore_terminal();
-    result.and(restore_result)
+
+    // alternate screen을 떠난 뒤에만 이 메시지를 찍는다 - 그 전에 찍으면 화면
+    // 위에 그대로 파묻힌다. 수집 스레드가 패닉으로 죽었더라도 여기서는 패닉
+    // 덤프를 다시 찍지 않고, 무슨 일이 있었는지 한 줄로만 알린다.
+    if let Ok(ExitReason::CollectorGone) = &result {
+        eprintln!("tracon: collector 스레드가 종료되어 tracon을 종료합니다.");
+    }
+
+    result.map(|_| ()).and(restore_result)
+}
+
+/// 이번 tick에 채널을 비운 결과. `Continue`는 평범한 유휴 상태이고,
+/// `CollectorGone`은 송신자가 사라졌다는 뜻이다 - 수집 스레드가 정상 종료했든
+/// 패닉으로 죽었든, 더 이상 새 스냅샷이 올 수 없으므로 루프를 끝내야 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    Continue,
+    CollectorGone,
+}
+
+/// 채널에 쌓인 스냅샷을 전부 반영한다. `terminal.draw`/`event::poll`과 달리
+/// 순수 함수라 헤드리스로 테스트할 수 있다.
+fn drain_snapshots(app: &mut App, rx: &mpsc::Receiver<Snapshot>) -> PollOutcome {
+    loop {
+        match rx.try_recv() {
+            Ok(snap) => app.apply(snap),
+            Err(mpsc::TryRecvError::Empty) => return PollOutcome::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => return PollOutcome::CollectorGone,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitReason {
+    Quit,
+    CollectorGone,
 }
 
 /// 100ms마다 키를 폴링하고, 채널에 새 스냅샷이 있으면 반영한 뒤 매 tick 다시 그린다.
@@ -189,20 +233,20 @@ fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     rx: &mpsc::Receiver<Snapshot>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ExitReason> {
     loop {
         terminal.draw(|f| render(f, &app.snapshot, app.selected))?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press && app.on_key(key.code) == Action::Quit {
-                    return Ok(());
+                    return Ok(ExitReason::Quit);
                 }
             }
         }
 
-        while let Ok(snap) = rx.try_recv() {
-            app.apply(snap);
+        if drain_snapshots(app, rx) == PollOutcome::CollectorGone {
+            return Ok(ExitReason::CollectorGone);
         }
     }
 }
@@ -391,6 +435,28 @@ mod loop_tests {
         snap.sessions.rotate_left(1);
         app.apply(snap);
         assert_eq!(app.selected_key().map(|k| k.uuid.clone()), selected_uuid);
+    }
+
+    /// 수집 스레드가 정상 종료했든 패닉으로 죽었든, 송신자가 드롭되면 채널은
+    /// Disconnected를 돌려준다. `drain_snapshots`는 이 둘을 구분하지 않고 똑같이
+    /// "더 이상 새 데이터가 오지 않는다"로 취급해야 한다 - 이 테스트는 실제
+    /// 스레드나 타이밍 없이, 송신자를 직접 drop해서 그 경로만 헤드리스로 확인한다.
+    #[test]
+    fn drain_snapshots_signals_exit_when_the_sender_is_dropped() {
+        let (tx, rx) = mpsc::channel::<crate::json::Snapshot>();
+        drop(tx);
+        let mut app = app_with(1);
+        assert_eq!(
+            super::drain_snapshots(&mut app, &rx),
+            PollOutcome::CollectorGone
+        );
+    }
+
+    #[test]
+    fn drain_snapshots_continues_when_the_channel_is_merely_empty() {
+        let (_tx, rx) = mpsc::channel::<crate::json::Snapshot>();
+        let mut app = app_with(1);
+        assert_eq!(super::drain_snapshots(&mut app, &rx), PollOutcome::Continue);
     }
 
     #[test]
