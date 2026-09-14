@@ -437,6 +437,44 @@ pub(crate) mod tests {
         assert!(text.contains("project-0"));
     }
 
+    /// CTX 열은 7칸짜리 바에 사용률까지 담아야 하고, JUMP 열은 `tmux:main:1.2`
+    /// 같은 13자 라벨을 담아야 한다. 열이 좁으면 50%와 100%가 똑같이 잘려 보이고,
+    /// 점프 대상도 전부 `tmux:m`으로 뭉개져 서로 구분되지 않는다.
+    #[test]
+    fn ctx_and_jump_columns_are_not_truncated() {
+        let backend = TestBackend::new(100, 10);
+        let mut term = Terminal::new(backend).expect("terminal");
+        let mut full = sample_session();
+        full.ctx_tokens = Some(200_000);
+        full.ctx_window = Some(200_000);
+        full.jump = Some("tmux:main:1.2".into());
+        let mut half = sample_session();
+        half.key.uuid = "u1".into();
+        half.ctx_tokens = Some(100_000);
+        half.ctx_window = Some(200_000);
+        half.jump = Some("cmux:12".into());
+
+        let snap = crate::json::Snapshot {
+            sessions: vec![full, half],
+            hooks_installed: false,
+            cmux_linked: false,
+            generated_at_ms: 1_060_000,
+        };
+        term.draw(|f| render(f, &snap, 0)).expect("draw");
+        let text = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("####### 100%"), "100% 행이 잘렸다");
+        assert!(text.contains("####...  50%"), "50% 행이 잘렸다");
+        assert!(text.contains("tmux:main:1.2"), "JUMP 라벨이 잘렸다");
+        assert!(text.contains("cmux:12"));
+    }
+
     #[test]
     fn degrade_flags_flip_when_sources_are_live() {
         let backend = TestBackend::new(90, 14);

@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn colors_fold_seven_states_into_three() {
+    fn colors_fold_eight_states_into_four_colours() {
         assert_eq!(State::WaitingApproval.color(), Color::Red);
         assert_eq!(State::WaitingInput.color(), Color::Red);
         assert_eq!(State::RunningInference.color(), Color::Green);

@@ -13,20 +13,22 @@ finished and are waiting for your next message. tracon watches all of them at
 once and puts the ones that need you at the top of the list, in red.
 
 ```
-+ tracon ------------------------------------------------------------------+
-| Waiting 2  Running 1  Idle 1  Stale 0     hooks on   cmux linked         |
-+----------------------------------------------------------------------------+
-+ sessions -------------------------------------------------------------+
-| ST  LAST   DUR    CTX% CPU%  MODEL             PROJECT       JUMP        |
-| WA  0s     14m    62%  0.0   claude-opus-5     acme-api       tmux:main:1.2|
-| WI  3s     41m    18%  0.0   claude-sonnet-5   nebula-web     tmux:main:2.1|
-| RT  1s     5m     44%  38.2  gpt-5-codex       lighthouse-cli -           |
-| ID  22m    2h      9%  0.0   claude-opus-5     forge-infra    -           |
-+----------------------------------------------------------------------------+
+┌tracon────────────────────────────────────────────────────────────────────────────────┐
+│Waiting 2  Running 1  Idle 1  Stale 0   hooks on  cmux linked                         │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+┌sessions──────────────────────────────────────────────────────────────────────────────┐
+│ST LAST   DUR    CTX%         CPU%  MODEL            PROJECT            JUMP          │
+│WI 3s     41m00s #......  18% 0.0   claude-sonnet-5  kestrel-web        cmux:3        │
+│WA 0s     14m00s ####...  62% 0.0   claude-opus-5    harbor-api         tmux:main:1.2 │
+│RT 1s     5m00s  ###....  44% 38.2  gpt-5-codex      meridian-cli       -             │
+│ID 22m00s 2h     #......   9% 0.0   claude-opus-5    driftwood-infra    -             │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-(The output above is composed for illustration; PROJECT values are invented
-names, not real repositories.)
+(That block is a real frame from tracon's own renderer, rendered from sample
+sessions - the PROJECT names are invented, not repositories on anyone's disk.
+Note the ordering: waiting rows sort above the running one, and within the same
+colour the session kept waiting longest comes first.)
 
 `ST` codes: `WA` waiting for approval, `WI` waiting for input, `RI` running
 inference, `RT` running a tool, `ID` idle, `ST` stale (untouched for a day),
@@ -74,8 +76,11 @@ lower-confidence guess. Fact-confidence sources always win over inference.
 ## Install
 
 ```sh
-cargo install tracon
+cargo install --git https://github.com/KKamJi98/tracon
 ```
+
+A crates.io release (`cargo install tracon`) is planned but not published yet,
+so the git install above is the one that works today.
 
 Supported platforms: macOS and Linux. Windows is out of scope.
 
@@ -91,6 +96,14 @@ tracon hooks print      # prints the hook JSON fragment to stdout
 backs the existing file up, merges tracon's hook entries into it, and leaves
 everything else in the file untouched. Use this if you manage that file by
 hand.
+
+Install the binary before installing the hooks. `tracon hooks install` writes
+the absolute path of the running executable into the settings file, so a path
+under `target/` (what you get from `cargo run`) stops working the moment you
+run `cargo clean`. tracon refuses to install from such a path. For the same
+reason, run `tracon hooks uninstall` before you delete or move the binary -
+otherwise every hook event in every claude session tries to run a program that
+is no longer there.
 
 `tracon hooks print` does not touch any file - it prints the same JSON
 fragment so you can paste it into whatever generates your claude settings
@@ -115,10 +128,13 @@ snapshot.
   record, so there is no fact-based signal for this state the way there is
   for a trailing `task_complete` (which does map to a fact-confidence
   waiting-for-input state).
-- A waiting verdict produced by layer 0 alone (no hooks, no cmux) renders as
-  dim red instead of solid red. It is tracon's best guess from process and
-  transcript state, not an observed fact - solid red is reserved for
-  waiting states confirmed by layer 1 or layer 2.
+- Dim red does not mean "no hooks". Only one verdict renders dim red: the
+  layer-0 guess that an unmatched tool call plus idle CPU means an approval
+  prompt. Every other waiting verdict renders solid red, including the common
+  layer-0 one (the transcript ends with an assistant message and nothing is
+  pending), so a guessed waiting-for-input row looks the same as a
+  hook-confirmed one. The `hooks off` and `cmux unavailable` flags in the
+  overview line are what tell you how much of the screen is inferred.
 
 ## Status
 
