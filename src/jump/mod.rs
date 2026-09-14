@@ -1,11 +1,13 @@
-//! 점프 대상 탐색과 실행. tmux는 어느 터미널에서나 쓰이는 표준이라 먼저 다루고,
-//! 특정 앱(cmux) 전용 어댑터는 다음 태스크에서 추가한다.
+//! 점프 대상 탐색과 실행. tmux는 어느 터미널에서나 쓰이는 표준이고, cmux는
+//! 선택적으로 붙는 세션 매니저 어댑터(레이어 2)다.
 //!
 //! 스냅샷 한 번에 Jumper::refresh를 한 번씩만 호출해 tmux list-panes 같은 비용이
 //! 드는 조회를 tick당 한 번으로 묶는다 - resolve_tty는 그 캐시를 읽기만 하는
-//! 순수 조회라 세션 수만큼 불러도 새 프로세스를 띄우지 않는다.
+//! 순수 조회라 세션 수만큼 불러도 새 프로세스를 띄우지 않는다. cmux는 workspace_id로
+//! 찾아야 해서 tty 기반인 이 trait을 그대로 쓰지 않는다 - `Collector`가 별도로 다룬다.
 
 pub mod clipboard;
+pub mod cmux;
 pub mod tmux;
 
 use crate::model::{Provider, Session};
@@ -13,7 +15,6 @@ use crate::model::{Provider, Session};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JumpTarget {
     Tmux(String),
-    #[allow(dead_code)]
     Cmux(String),
 }
 
@@ -54,6 +55,9 @@ pub fn resume_command(session: &Session) -> String {
 pub fn jump_to(label: &str) -> anyhow::Result<()> {
     if let Some(target) = label.strip_prefix("tmux:") {
         return tmux::switch_to(target);
+    }
+    if let Some(target) = label.strip_prefix("cmux:") {
+        return cmux::CmuxJumper::jump(target);
     }
     anyhow::bail!("알 수 없는 점프 대상: {label}")
 }

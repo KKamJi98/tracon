@@ -210,11 +210,17 @@ pub fn run_tui() -> anyhow::Result<()> {
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
+    // cmux가 없거나 구독이 즉시 죽으면 None이고, 그 아래 나머지는 cmux가 존재한
+    // 적 없는 것처럼 그대로 동작한다 - 레이어 2는 언제나 선택이다.
+    let cmux_rx = crate::collect::cmux::CmuxSubscriber::spawn();
+    let cmux_jumper = cmux_rx.is_some().then(crate::jump::cmux::CmuxJumper::new);
     let mut collector = crate::collect::Collector::new(
         Box::new(crate::collect::proc::SysProcessSource::new()),
         crate::config::Thresholds::default(),
     )
-    .with_jumpers(vec![Box::new(crate::jump::tmux::TmuxJumper::new())]);
+    .with_jumpers(vec![Box::new(crate::jump::tmux::TmuxJumper::new())])
+    .with_cmux(cmux_rx)
+    .with_cmux_jumper(cmux_jumper);
     // 첫 프레임은 백그라운드 스레드의 1초 tick을 기다리지 않고 즉시 그린다.
     let mut app = App::new(collector.snapshot(crate::collect::hooksink::now_ms()));
 

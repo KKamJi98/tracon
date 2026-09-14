@@ -1,3 +1,4 @@
+pub mod cmux;
 pub mod hooksink;
 pub mod layer0;
 pub mod proc;
@@ -25,6 +26,14 @@ pub struct Collector {
     // tmux list-panes 같은 비용이 드는 조회는 tick당 딱 한 번(refresh)만 하고,
     // 세션마다 하는 resolve_tty는 그 캐시를 읽는 순수 조회다.
     jumpers: Vec<Box<dyn Jumper>>,
+    // 레이어 2(cmux). None이면 cmux가 없거나 아직 연결을 시도하지 않은 것 -
+    // 이 경우 나머지 전부는 cmux가 존재한 적 없는 것처럼 그대로 동작해야 한다.
+    cmux_rx: Option<std::sync::mpsc::Receiver<cmux::CmuxEvent>>,
+    cmux_linked: bool,
+    cmux_jumper: Option<crate::jump::cmux::CmuxJumper>,
+    // 세션마다 마지막으로 본 cmux workspace_id. cmux 이벤트가 tick마다 오지는
+    // 않으므로(trackers/tailer와 같은 이유로) 점프 대상을 잃지 않으려면 유지해야 한다.
+    cmux_workspaces: std::collections::HashMap<SessionKey, String>,
 }
 
 /// `/home/dev/code/app` -> `-home-dev-code-app`
@@ -98,6 +107,10 @@ impl Collector {
             projects_root: home.join(".claude/projects"),
             sink_dir: hooksink::sink_dir(),
             jumpers: Vec::new(),
+            cmux_rx: None,
+            cmux_linked: false,
+            cmux_jumper: None,
+            cmux_workspaces: std::collections::HashMap::new(),
         }
     }
 
@@ -120,6 +133,23 @@ impl Collector {
         self
     }
 
+    /// cmux 이벤트 구독을 연결한다. `CmuxSubscriber::spawn()`이 돌려준 채널이다.
+    /// `None`이면(cmux 없음) 레이어 2는 계속 비활성으로 남는다.
+    #[allow(dead_code)]
+    pub fn with_cmux(mut self, rx: Option<std::sync::mpsc::Receiver<cmux::CmuxEvent>>) -> Self {
+        self.cmux_linked = rx.is_some();
+        self.cmux_rx = rx;
+        self
+    }
+
+    /// workspace 점프 대상을 찾아낼 cmux 어댑터를 등록한다. `None`이면(cmux 구독이
+    /// 없음) 세션은 tty 기반 Jumper로만 점프 대상을 찾는다.
+    #[allow(dead_code)]
+    pub fn with_cmux_jumper(mut self, jumper: Option<crate::jump::cmux::CmuxJumper>) -> Self {
+        self.cmux_jumper = jumper;
+        self
+    }
+
     pub fn snapshot(&mut self, now_ms: i64) -> Snapshot {
         let live: Vec<ProcInfo> = self.procs.list_agents();
         let sink_records = hooksink::read_all(&self.sink_dir);
@@ -130,6 +160,44 @@ impl Collector {
         // 조회라 20세션이어도 새 프로세스가 늘지 않는다.
         for jumper in &mut self.jumpers {
             jumper.refresh();
+        }
+        if let Some(jumper) = &mut self.cmux_jumper {
+            jumper.refresh();
+        }
+
+        // 이번 tick에 새로 들어온 cmux 이벤트를 전부 비운다. `Empty`는 "당장은
+        // 없음"이라 링크가 살아있다고 본다. `Disconnected`는 구독 스레드가 죽었다는
+        // 뜻이라 - cmux 프로세스가 도중에 사라졌거나 소켓이 끊겼거나 - 그때부터
+        // cmux 없이 동작하던 상태로 되돌아간다(터미널 중립성).
+        let mut cmux_events: Vec<cmux::CmuxEvent> = Vec::new();
+        let mut cmux_disconnected = false;
+        if let Some(rx) = self.cmux_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => cmux_events.push(ev),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        cmux_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if cmux_disconnected {
+            self.cmux_rx = None;
+            self.cmux_linked = false;
+        }
+
+        let mut cmux_by_key: std::collections::HashMap<SessionKey, Vec<Observation>> =
+            std::collections::HashMap::new();
+        for ev in &cmux_events {
+            if let Some(id) = &ev.workspace_id {
+                self.cmux_workspaces
+                    .insert(ev.record.key.clone(), id.clone());
+            }
+            if let Some(obs) = ev.to_observation() {
+                cmux_by_key.entry(obs.key.clone()).or_default().push(obs);
+            }
         }
 
         // transcript 배정을 프로세스 순회보다 먼저 전부 끝낸다. session_id가 같은
@@ -219,6 +287,9 @@ impl Collector {
                     .filter(|r| &r.key == key)
                     .filter_map(|r| r.to_observation()),
             );
+            if let Some(cx) = cmux_by_key.get(key) {
+                observations.extend(cx.iter().cloned());
+            }
 
             let Some(win) = winner(&observations) else {
                 continue;
@@ -226,10 +297,19 @@ impl Collector {
             let last_change = summary.as_ref().map(|s| s.last_ts_ms).unwrap_or(now_ms);
             let ctx_tokens = summary.as_ref().and_then(|s| s.usage.map(|u| u.total()));
             let model = summary.as_ref().and_then(|s| s.model.clone());
-            let jump = p.tty.as_deref().and_then(|tty| {
-                self.jumpers
-                    .iter()
-                    .find_map(|jumper| jumper.resolve_tty(tty))
+            // cmux가 workspace_id를 사실로 주면 그쪽을 우선한다 - tty 기반 Jumper는
+            // cmux 없이도 동작해야 하는 폴백이다.
+            let cmux_jump = self.cmux_workspaces.get(key).and_then(|wsid| {
+                self.cmux_jumper
+                    .as_ref()
+                    .and_then(|jumper| jumper.resolve(wsid))
+            });
+            let jump = cmux_jump.or_else(|| {
+                p.tty.as_deref().and_then(|tty| {
+                    self.jumpers
+                        .iter()
+                        .find_map(|jumper| jumper.resolve_tty(tty))
+                })
             });
 
             sessions.push(Session {
@@ -258,11 +338,15 @@ impl Collector {
         // 폴링하는 TUI에서 두 맵이 시간이 지날수록 계속 커지는 메모리 누수가 된다.
         self.trackers.retain(|path, _| claimed.contains(path));
         self.tailer.retain(&claimed);
+        // by_key는 이번 tick에 실제로 화면에 오른 세션 키만 담는다 - trackers/tailer와
+        // 같은 이유로, 더는 없는 세션의 workspace_id를 무한정 들고 있지 않는다.
+        self.cmux_workspaces
+            .retain(|key, _| by_key.contains_key(key));
 
         Snapshot {
             sessions,
             hooks_installed,
-            cmux_linked: false,
+            cmux_linked: self.cmux_linked,
             generated_at_ms: now_ms,
         }
     }

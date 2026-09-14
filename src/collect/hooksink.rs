@@ -75,9 +75,10 @@ struct ClaudeHookStdin {
     cwd: Option<String>,
 }
 
-pub fn event_from_claude_hook(stdin: &str) -> Option<SinkRecord> {
-    let raw: ClaudeHookStdin = serde_json::from_str(stdin).ok()?;
-    let event = match raw.hook_event_name.as_str() {
+/// 훅 이벤트 이름 문자열을 `HookEvent`로 옮긴다. cmux 어댑터(Task 14)도 같은
+/// 매핑을 쓰므로 이 함수 하나로 모아 둔다 - 두 곳에서 따로 유지하면 표가 갈라진다.
+pub(crate) fn hook_event_from_name(name: &str) -> Option<HookEvent> {
+    Some(match name {
         "SessionStart" => HookEvent::SessionStart,
         "UserPromptSubmit" => HookEvent::UserPromptSubmit,
         "PreToolUse" => HookEvent::PreToolUse,
@@ -88,7 +89,12 @@ pub fn event_from_claude_hook(stdin: &str) -> Option<SinkRecord> {
         "SubagentStop" => HookEvent::SubagentStop,
         "SessionEnd" => HookEvent::SessionEnd,
         _ => return None,
-    };
+    })
+}
+
+pub fn event_from_claude_hook(stdin: &str) -> Option<SinkRecord> {
+    let raw: ClaudeHookStdin = serde_json::from_str(stdin).ok()?;
+    let event = hook_event_from_name(&raw.hook_event_name)?;
     Some(SinkRecord {
         key: SessionKey {
             provider: Provider::Claude,
