@@ -6,6 +6,7 @@ mod hooks;
 mod json;
 mod merge;
 mod model;
+mod ui;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
