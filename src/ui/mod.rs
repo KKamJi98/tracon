@@ -20,12 +20,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+/// 화면 맨 아래 한 줄에 띄우는 키 안내. 실제로 동작하는 키만 적는다 - `x`(kill)와
+/// `s`(sort)는 아직 아무 일도 하지 않으므로 광고하지 않는다.
+pub(crate) const KEY_HINTS: &str = "enter jump   r copy resume   j/k move   q quit";
+
 #[allow(dead_code)]
 pub fn render(frame: &mut Frame, snap: &Snapshot, selected: usize) {
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+    // 푸터는 고정 1줄, 테이블이 남는 높이를 받는다. 화면이 아주 낮으면 테이블 쪽이
+    // 0줄로 줄어들 뿐 렌더는 계속 성립한다.
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
     overview::render(frame, chunks[0], snap);
     table::render(frame, chunks[1], snap, selected);
+    frame.render_widget(Paragraph::new(KEY_HINTS), chunks[2]);
 }
 
 /// 밀리초를 `2s`, `4m12s`, `5h`, `5d02h` 형태로 압축한다.
@@ -298,7 +310,8 @@ fn event_loop<B: Backend>(
             render(f, &app.snapshot, app.selected);
             // 클립보드 폴백 메시지는 render()가 그리는 고정 레이아웃과 별개로,
             // 화면 맨 아래 한 줄에 덧그린다 - render()는 테스트가 직접 호출하는
-            // 순수 함수라 시그니처를 바꾸고 싶지 않다.
+            // 순수 함수라 시그니처를 바꾸고 싶지 않다. 그 자리는 키 안내 푸터라,
+            // 메시지가 떠 있는 동안에는 안내 대신 메시지가 보인다.
             if let Some(msg) = &app.message {
                 let area = f.area();
                 if area.height > 0 {
@@ -473,6 +486,118 @@ pub(crate) mod tests {
         assert!(text.contains("####...  50%"), "50% 행이 잘렸다");
         assert!(text.contains("tmux:main:1.2"), "JUMP 라벨이 잘렸다");
         assert!(text.contains("cmux:12"));
+    }
+
+    fn text_of(width: u16, height: u16, snap: &crate::json::Snapshot) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render(f, snap, 0)).expect("draw");
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    }
+
+    fn snap_of(sessions: Vec<Session>) -> crate::json::Snapshot {
+        crate::json::Snapshot {
+            sessions,
+            hooks_installed: false,
+            cmux_linked: false,
+            generated_at_ms: 1_060_000,
+        }
+    }
+
+    /// 처음 쓰는 사람이 나가는 법을 화면에서 알 수 있어야 한다. 동작하지 않는
+    /// `x`(kill)와 `s`(sort)는 광고하지 않는다.
+    #[test]
+    fn footer_lists_only_the_keys_that_work() {
+        let text = text_of(90, 14, &snap_with(&[State::Idle]));
+        for hint in ["enter jump", "r copy resume", "j/k move", "q quit"] {
+            assert!(text.contains(hint), "푸터에 {hint}가 없다");
+        }
+        assert!(
+            !text.contains("x kill"),
+            "동작하지 않는 x를 광고하면 안 된다"
+        );
+        assert!(
+            !text.contains("s sort"),
+            "동작하지 않는 s를 광고하면 안 된다"
+        );
+    }
+
+    /// 푸터가 생겨도 좁은 터미널에서 패닉하지 않아야 한다.
+    #[test]
+    fn render_survives_a_tiny_terminal() {
+        let snap = snap_with(&[State::WaitingApproval, State::Idle]);
+        for (w, h) in [(20, 5), (20, 4), (20, 1), (1, 1), (80, 3)] {
+            let _ = text_of(w, h, &snap);
+        }
+    }
+
+    /// 컨텍스트를 못 읽은 세션은 0%가 아니다. 프로그램이 모르는 수치를 단언하지 않는다.
+    #[test]
+    fn ctx_column_shows_a_dash_when_context_is_unknown() {
+        let mut s = sample_session();
+        s.ctx_tokens = None;
+        s.ctx_window = None;
+        let text = text_of(100, 10, &snap_of(vec![s]));
+        assert!(
+            !text.contains("......."),
+            "컨텍스트를 모르면 0% 바를 그리지 않는다"
+        );
+        assert!(!text.contains(" 0%"), "모르는 값을 0%라고 단언하면 안 된다");
+    }
+
+    /// 스펙 6절: 85%를 넘으면 사용률 뒤에 `!`를 붙인다. compaction 임박 세션을
+    /// 찾는 것이 이 도구의 2순위 목표다.
+    #[test]
+    fn ctx_over_85_pct_gets_a_bang_marker() {
+        let mut hot = sample_session();
+        hot.ctx_tokens = Some(180_000);
+        hot.ctx_window = Some(200_000);
+        let text = text_of(100, 10, &snap_of(vec![hot]));
+        assert!(text.contains("90% !"), "85% 초과 행에 ! 표시가 없다");
+
+        let mut warm = sample_session();
+        warm.ctx_tokens = Some(160_000);
+        warm.ctx_window = Some(200_000);
+        let text = text_of(100, 10, &snap_of(vec![warm]));
+        assert!(text.contains("80%"));
+        assert!(!text.contains("80% !"), "85% 이하에는 ! 표시가 없다");
+    }
+
+    /// 스펙 6절: 오버뷰에 85% 초과 세션 수를 센다.
+    #[test]
+    fn overview_counts_sessions_over_85_pct() {
+        let hot = |tokens: u64, uuid: &str| {
+            let mut s = sample_session();
+            s.key.uuid = uuid.into();
+            s.ctx_tokens = Some(tokens);
+            s.ctx_window = Some(200_000);
+            s
+        };
+        let text = text_of(
+            100,
+            12,
+            &snap_of(vec![
+                hot(180_000, "a"),
+                hot(190_000, "b"),
+                hot(20_000, "c"),
+                {
+                    let mut s = sample_session();
+                    s.key.uuid = "d".into();
+                    s.ctx_tokens = None;
+                    s.ctx_window = None;
+                    s
+                },
+            ]),
+        );
+        assert!(
+            text.contains("ctx over 85%: 2"),
+            "오버뷰에 85% 초과 카운터가 없다"
+        );
     }
 
     #[test]

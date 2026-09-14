@@ -16,6 +16,16 @@ pub struct Counts {
     pub running: usize,
     pub idle: usize,
     pub stale: usize,
+    /// 컨텍스트 사용률이 압박 임계를 넘긴 세션 수. compaction 임박 세션을 찾는 것이
+    /// 이 도구의 2순위 목표다.
+    pub ctx_pressure: usize,
+}
+
+/// 컨텍스트 압박 임계. 이 값을 **넘으면** 행에 `!`가 붙고 오버뷰 카운터에 잡힌다.
+pub const CTX_PRESSURE_PCT: u32 = 85;
+
+pub fn is_ctx_pressure(pct: u32) -> bool {
+    pct > CTX_PRESSURE_PCT
 }
 
 impl Snapshot {
@@ -28,6 +38,9 @@ impl Snapshot {
                 Color::Green => c.running += 1,
                 Color::Plain => c.idle += 1,
                 Color::Dim => c.stale += 1,
+            }
+            if s.ctx_pct().is_some_and(is_ctx_pressure) {
+                c.ctx_pressure += 1;
             }
         }
         c

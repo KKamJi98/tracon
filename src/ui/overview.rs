@@ -26,6 +26,12 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             counts.waiting, counts.running, counts.idle, counts.stale
         )),
         Span::raw("   "),
+        Span::raw(format!(
+            "ctx over {}%: {}",
+            crate::json::CTX_PRESSURE_PCT,
+            counts.ctx_pressure
+        )),
+        Span::raw("   "),
         Span::raw(hooks),
         Span::raw("  "),
         Span::raw(cmux),

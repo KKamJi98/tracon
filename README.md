@@ -14,21 +14,23 @@ once and puts the ones that need you at the top of the list, in red.
 
 ```
 ┌tracon────────────────────────────────────────────────────────────────────────────────┐
-│Waiting 2  Running 1  Idle 1  Stale 0   hooks on  cmux linked                         │
+│Waiting 2  Running 1  Idle 1  Stale 0   ctx over 85%: 1   hooks on  cmux linked       │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ┌sessions──────────────────────────────────────────────────────────────────────────────┐
-│ST LAST   DUR    CTX%         CPU%  MODEL            PROJECT            JUMP          │
-│WI 3s     41m00s #......  18% 0.0   claude-sonnet-5  kestrel-web        cmux:3        │
-│WA 0s     14m00s ####...  62% 0.0   claude-opus-5    harbor-api         tmux:main:1.2 │
-│RT 1s     5m00s  ###....  44% 38.2  gpt-5-codex      meridian-cli       -             │
-│ID 22m00s 2h     #......   9% 0.0   claude-opus-5    driftwood-infra    -             │
+│ST LAST   DUR    CTX%           CPU%  MODEL            PROJECT          JUMP          │
+│WI 3s     41m00s #......  18%   0.0   claude-sonnet-5  kestrel-web      cmux:3        │
+│WA 0s     14m00s ####...  62%   0.0   claude-opus-5    harbor-api       tmux:main:1.2 │
+│RT 1s     5m00s  ###....  44%   38.2  gpt-5-codex      meridian-cli     -             │
+│ID 22m00s 2h     ######.  88% ! 0.0   claude-opus-5    driftwood-infra  -             │
 └──────────────────────────────────────────────────────────────────────────────────────┘
+enter jump   r copy resume   j/k move   q quit
 ```
 
 (That block is a real frame from tracon's own renderer, rendered from sample
 sessions - the PROJECT names are invented, not repositories on anyone's disk.
 Note the ordering: waiting rows sort above the running one, and within the same
-colour the session kept waiting longest comes first.)
+colour the session kept waiting longest comes first. The `!` marks a session
+over 85% of its context window, and the overview line counts those.)
 
 `ST` codes: `WA` waiting for approval, `WI` waiting for input, `RI` running
 inference, `RT` running a tool, `ID` idle, `ST` stale (untouched for a day),

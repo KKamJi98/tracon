@@ -23,7 +23,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, selected: u
         .map(|(i, s)| row_for(s, now, i == selected))
         .collect();
 
-    // CTX는 7칸 바 + 공백 + `100%`까지 12칸을 그대로 담아야 한다. 더 좁으면
+    // CTX는 7칸 바 + 공백 + `100%` + 85% 초과 표시 ` !`까지 14칸을 담아야 한다. 더 좁으면
     // 50%와 100%가 똑같이 잘려 보여 컨텍스트 압박을 읽을 수 없다. JUMP도
     // `tmux:main:1.2`(13자)가 들어가야 점프 대상이 서로 구분된다.
     // PROJECT만 남는 폭을 받는다.
@@ -31,7 +31,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, selected: u
         Constraint::Length(2),
         Constraint::Length(6),
         Constraint::Length(6),
-        Constraint::Length(12),
+        Constraint::Length(14),
         Constraint::Length(5),
         Constraint::Length(16),
         Constraint::Min(10),
@@ -78,9 +78,20 @@ fn row_for(session: &Session, now_ms: i64, selected: bool) -> Row<'static> {
         .map(|started| crate::ui::format_age(now_ms.saturating_sub(started)))
         .unwrap_or_else(|| "-".to_string());
     // 바만 그리면 헤더의 `CTX%`가 약속한 수치가 빠진다 - 바는 7단계라 한 칸이
-    // 14%p를 덮어서 바만으로는 압박 정도를 읽을 수 없다.
-    let pct = session.ctx_pct().unwrap_or(0);
-    let ctx = format!("{} {pct:>3}%", crate::ui::ctx_bar(pct));
+    // 14%p를 덮어서 바만으로는 압박 정도를 읽을 수 없다. 컨텍스트를 못 읽은
+    // 세션은 0%가 아니라 미지수이므로 바 대신 `-`를 그린다.
+    let ctx = match session.ctx_pct() {
+        Some(pct) => format!(
+            "{} {pct:>3}%{}",
+            crate::ui::ctx_bar(pct),
+            if crate::json::is_ctx_pressure(pct) {
+                " !"
+            } else {
+                ""
+            }
+        ),
+        None => "-".to_string(),
+    };
     let cpu = session
         .cpu
         .map(|c| format!("{c:.1}"))
