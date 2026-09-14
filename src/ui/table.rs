@@ -80,7 +80,8 @@ fn row_for(session: &Session, now_ms: i64, selected: bool) -> Row<'static> {
         .unwrap_or_else(|| "-".to_string());
     let model = session.model.clone().unwrap_or_else(|| "-".to_string());
     let project = project_name(session.cwd.as_deref());
-    // JUMP은 Session.jump가 채워지는 후속 태스크 전까지 항상 "-"다.
+    // JUMP은 Collector가 tmux 같은 Jumper로 대상을 찾아냈을 때만 라벨을 보여주고,
+    // 그 외(tmux 밖 세션, tmux 미설치 등)에는 "-"다.
     let jump = session.jump.clone().unwrap_or_else(|| "-".to_string());
 
     let mut style = crate::ui::theme::color_for_row(session.state, session.confidence);
