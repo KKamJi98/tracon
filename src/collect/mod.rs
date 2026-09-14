@@ -31,24 +31,50 @@ pub fn transcript_path_for(projects_root: &Path, cwd: &Path, uuid: &str) -> Path
         .join(format!("{uuid}.jsonl"))
 }
 
-/// session_id를 모르는 프로세스를 위해 cwd 디렉터리에서 가장 최근 jsonl을 고른다.
-fn newest_transcript(projects_root: &Path, cwd: &Path) -> Option<(String, PathBuf)> {
+/// session_id를 모르는 프로세스를 위해 cwd 디렉터리의 jsonl 후보를 최신 mtime 순으로 나열한다.
+/// 같은 cwd에 세션이 여러 개면 이미 배정된 파일을 걸러내고 남은 것 중에서 고르게 하기 위함이다.
+fn transcripts_for_cwd(
+    projects_root: &Path,
+    cwd: &Path,
+) -> Vec<(String, PathBuf, std::time::SystemTime)> {
     let dir = projects_root.join(slug_for_cwd(cwd));
-    let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
-            continue;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut items: Vec<(String, PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                return None;
+            }
+            let mtime = entry.metadata().and_then(|m| m.modified()).ok()?;
+            let stem = path.file_stem()?.to_string_lossy().into_owned();
+            Some((stem, path, mtime))
+        })
+        .collect();
+    items.sort_by_key(|item| std::cmp::Reverse(item.2));
+    items
+}
+
+/// 같은 세션을 가리키는 여러 프로세스(부모/워커) 관측 중 cpu가 더 높은 쪽을 대표로 남긴다.
+fn merge_proc(
+    by_key: &mut std::collections::HashMap<SessionKey, (ProcInfo, Option<PathBuf>)>,
+    key: SessionKey,
+    p: ProcInfo,
+    path: Option<PathBuf>,
+) {
+    use std::collections::hash_map::Entry;
+    match by_key.entry(key) {
+        Entry::Occupied(mut e) => {
+            if p.cpu > e.get().0.cpu {
+                e.insert((p, path));
+            }
         }
-        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        let stem = path.file_stem()?.to_string_lossy().into_owned();
-        if best.as_ref().map(|(t, _, _)| mtime > *t).unwrap_or(true) {
-            best = Some((mtime, stem, path));
+        Entry::Vacant(e) => {
+            e.insert((p, path));
         }
     }
-    best.map(|(_, id, p)| (id, p))
 }
 
 impl Collector {
@@ -82,32 +108,72 @@ impl Collector {
         let sink_records = hooksink::read_all(&self.sink_dir);
         let hooks_installed = !sink_records.is_empty();
 
-        // 같은 session_id를 여러 프로세스(부모/워커)가 공유할 수 있다. transcript 경로
-        // 기준으로 세션당 하나만 남긴다 - Tailer가 같은 파일을 두 번 읽으면 두 번째
-        // 호출은 offset이 이미 끝까지 이동해 빈 조각을 받는다.
-        let mut by_key: std::collections::HashMap<SessionKey, (ProcInfo, PathBuf)> =
+        // transcript 배정을 프로세스 순회보다 먼저 전부 끝낸다. session_id가 같은
+        // 프로세스(부모/워커)는 하나의 세션으로 합치고 - Tailer가 같은 파일을 두 번
+        // 읽으면 두 번째 호출은 offset이 이미 끝까지 이동해 빈 조각을 받으므로 - session_id를
+        // 모르는 프로세스는 같은 cwd 안에서도 서로 다른 transcript를 하나씩 가져가게 해
+        // 세션이 뭉개지지 않게 한다.
+        let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut by_key: std::collections::HashMap<SessionKey, (ProcInfo, Option<PathBuf>)> =
             std::collections::HashMap::new();
+
+        // 1단계: session_id가 명시된 프로세스는 자기 transcript를 그대로 차지한다.
+        // 이 배정은 2단계보다 먼저 끝나므로 live 벡터 안에서의 순서와 무관하게 우선한다.
         for p in &live {
-            let Some((uuid, path)) = self.resolve_transcript(p) else {
+            let (Some(cwd), Some(id)) = (p.cwd.as_ref(), p.session_id.as_ref()) else {
                 continue;
             };
+            let path = transcript_path_for(&self.projects_root, cwd, id);
+            claimed.insert(path.clone());
             let key = SessionKey {
                 provider: p.provider,
-                uuid,
+                uuid: id.clone(),
             };
-            by_key
-                .entry(key)
-                .and_modify(|(cur, _)| {
-                    if p.cpu > cur.cpu {
-                        *cur = p.clone();
-                    }
-                })
-                .or_insert_with(|| (p.clone(), path));
+            merge_proc(&mut by_key, key, p.clone(), Some(path));
+        }
+
+        // 2단계: session_id를 모르는 프로세스는 같은 cwd에서 아직 배정되지 않은
+        // transcript 중 가장 최근 것을 하나씩 가져간다. 남은 transcript가 없어도
+        // 세션을 숨기지 않고 Unknown으로 띄운다.
+        for p in &live {
+            if p.session_id.is_some() {
+                continue;
+            }
+            let Some(cwd) = p.cwd.as_ref() else {
+                continue;
+            };
+            let pick = transcripts_for_cwd(&self.projects_root, cwd)
+                .into_iter()
+                .find(|(_, path, _)| !claimed.contains(path));
+
+            let (key, path) = match pick {
+                Some((uuid, path, _)) => {
+                    claimed.insert(path.clone());
+                    (
+                        SessionKey {
+                            provider: p.provider,
+                            uuid,
+                        },
+                        Some(path),
+                    )
+                }
+                None => (
+                    SessionKey {
+                        provider: p.provider,
+                        uuid: format!("no-transcript-{}", p.pid),
+                    },
+                    None,
+                ),
+            };
+            merge_proc(&mut by_key, key, p.clone(), path);
         }
 
         let mut sessions = Vec::new();
         for (key, (p, path)) in &by_key {
-            let chunk = self.tailer.read_new(path).unwrap_or_default();
+            let chunk = match path {
+                Some(path) => self.tailer.read_new(path).unwrap_or_default(),
+                None => String::new(),
+            };
             let summary = transcript::parse_tail(&chunk);
 
             let (state0, conf0) = layer0::infer(summary.as_ref(), true, p.cpu, now_ms, &self.cfg);
@@ -158,17 +224,6 @@ impl Collector {
             generated_at_ms: now_ms,
         }
     }
-
-    fn resolve_transcript(&self, p: &ProcInfo) -> Option<(String, PathBuf)> {
-        let cwd = p.cwd.as_ref()?;
-        if let Some(id) = &p.session_id {
-            return Some((
-                id.clone(),
-                transcript_path_for(&self.projects_root, cwd, id),
-            ));
-        }
-        newest_transcript(&self.projects_root, cwd)
-    }
 }
 
 #[cfg(test)]
@@ -187,9 +242,9 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
 
-    fn proc(uuid: Option<&str>, cwd: &str, cpu: f32) -> ProcInfo {
+    fn proc_with(pid: i32, uuid: Option<&str>, cwd: &str, cpu: f32) -> ProcInfo {
         ProcInfo {
-            pid: 100,
+            pid,
             provider: Provider::Claude,
             session_id: uuid.map(|u| u.to_string()),
             cwd: Some(PathBuf::from(cwd)),
@@ -197,6 +252,10 @@ mod tests {
             started_at_ms: NOW - 3_600_000,
             tty: None,
         }
+    }
+
+    fn proc(uuid: Option<&str>, cwd: &str, cpu: f32) -> ProcInfo {
+        proc_with(100, uuid, cwd, cpu)
     }
 
     #[test]
@@ -300,5 +359,84 @@ mod tests {
             .with_sink_dir(sink);
         let snap = c.snapshot(NOW);
         assert!(snap.sessions.is_empty());
+    }
+
+    #[test]
+    fn processes_without_session_id_in_same_cwd_get_distinct_sessions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::fs::write(proj.join("aaa.jsonl"), "").expect("write aaa");
+        std::fs::write(proj.join("bbb.jsonl"), "").expect("write bbb");
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![
+                proc_with(200, None, "/home/dev/app", 0.0),
+                proc_with(201, None, "/home/dev/app", 0.0),
+            ])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+        let snap = c.snapshot(NOW);
+
+        assert_eq!(snap.sessions.len(), 2);
+        assert_ne!(snap.sessions[0].key, snap.sessions[1].key);
+    }
+
+    #[test]
+    fn explicit_session_id_keeps_its_transcript_regardless_of_process_order() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::fs::write(proj.join("zzz.jsonl"), "").expect("write zzz");
+        // u1.jsonl gets a strictly later mtime than zzz.jsonl, so it is the transcript
+        // a naive "newest wins" fallback would hand to whichever process asks first.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let line = r#"{"type":"assistant","timestamp":"2027-01-15T00:00:00.000Z","cwd":"/home/dev/app","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        std::fs::write(proj.join("u1.jsonl"), format!("{line}\n")).expect("write u1");
+
+        // The session_id-less process is listed FIRST in the process list. If pass
+        // ordering mattered, it would grab u1.jsonl (the newest file) before the
+        // explicit-id process ever got a chance to claim it.
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![
+                proc_with(300, None, "/home/dev/app", 0.0),
+                proc_with(301, Some("u1"), "/home/dev/app", 0.0),
+            ])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+        let snap = c.snapshot(NOW);
+
+        assert_eq!(snap.sessions.len(), 2);
+        let explicit = snap
+            .sessions
+            .iter()
+            .find(|s| s.key.uuid == "u1")
+            .expect("explicit session present");
+        assert_eq!(explicit.pid, Some(301));
+
+        let other = snap
+            .sessions
+            .iter()
+            .find(|s| s.key.uuid != "u1")
+            .expect("second session present");
+        assert_eq!(other.pid, Some(300));
+        assert_eq!(other.key.uuid, "zzz");
+    }
+
+    #[test]
+    fn process_without_any_unclaimed_transcript_still_appears_as_unknown() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc_with(400, None, "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+        let snap = c.snapshot(NOW);
+
+        assert_eq!(snap.sessions.len(), 1);
+        assert_eq!(snap.sessions[0].state, State::Unknown);
+        assert_eq!(snap.sessions[0].pid, Some(400));
     }
 }
