@@ -2,6 +2,7 @@
 
 mod collect;
 mod config;
+mod hooks;
 mod merge;
 mod model;
 
