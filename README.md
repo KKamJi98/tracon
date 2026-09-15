@@ -73,7 +73,7 @@ here. The footer says how many are folded and `a` toggles them back in. The
 overview counter above keeps counting them either way, so folding hides the
 rows, not the fact.
 
-A finished turn reads as `waiting` for five minutes and then decays to `idle`.
+A finished turn reads as `waiting` for ten minutes and then decays to `idle`.
 The red is there to say *this session is asking for you*; a session you finished
 reading twenty minutes ago and walked away from is not that, and leaving it red
 wears the colour out.
