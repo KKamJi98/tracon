@@ -64,9 +64,17 @@ impl Default for SysProcessSource {
 
 impl ProcessSource for SysProcessSource {
     fn list_agents(&mut self) -> Vec<ProcInfo> {
-        use sysinfo::{ProcessRefreshKind, RefreshKind};
-        self.system
-            .refresh_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::everything()));
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+        // `remove_dead_processes = true`가 이 호출의 핵심이다. 편해 보이는
+        // `refresh_specifics`는 내부적으로 이 값을 false로 넘기고, 그러면 끝난
+        // 프로세스가 `System` 안에 영원히 남는다. `--json`은 매번 새 프로세스라
+        // 증상이 안 보이지만, `System` 하나를 계속 쓰는 TUI에서는 닫은 세션이
+        // 화면에서 사라지지 않는다.
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything(),
+        );
         let infos: Vec<ProcInfo> = self
             .system
             .processes()
@@ -99,6 +107,38 @@ mod tests {
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// 죽은 프로세스는 다음 tick에 사라져야 한다.
+    ///
+    /// sysinfo의 `refresh_specifics`는 내부적으로 `remove_dead_processes = false`로
+    /// 돈다. 그래서 오래 사는 `System` 하나를 계속 쓰는 TUI에서는 끝난 세션이 목록에
+    /// 영원히 남는다. `--json`은 매번 새 프로세스라 이 증상이 안 보인다 - 그쪽으로만
+    /// 확인하면 통과하는 것처럼 보이므로, 이 테스트는 한 source를 두 번 부른다.
+    #[test]
+    fn a_dead_agent_disappears_from_the_next_refresh() {
+        // basename만 보고 에이전트를 가리므로, sleep에 claude 이름을 붙여 띄운다.
+        let dir = tempfile::tempdir().expect("dir");
+        let fake = dir.path().join("claude");
+        std::os::unix::fs::symlink("/bin/sleep", &fake).expect("symlink");
+
+        let mut child = std::process::Command::new(&fake)
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id() as i32;
+
+        let mut source = SysProcessSource::new();
+        let listed = |s: &mut SysProcessSource| s.list_agents().iter().any(|p| p.pid == pid);
+        assert!(listed(&mut source), "살아 있는 에이전트를 못 봤다");
+
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+
+        assert!(
+            !listed(&mut source),
+            "죽은 프로세스가 같은 source의 다음 조회에 그대로 남았다"
+        );
     }
 
     #[test]
