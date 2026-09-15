@@ -88,6 +88,7 @@ fn agent_label(provider: crate::model::Provider) -> &'static str {
     match provider {
         crate::model::Provider::Claude => "claude",
         crate::model::Provider::Codex => "codex",
+        crate::model::Provider::Antigravity => "agy",
     }
 }
 

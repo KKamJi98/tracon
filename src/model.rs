@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub enum Provider {
     Claude,
     Codex,
+    /// Antigravity CLI(`agy`). 대화를 jsonl이 아니라 SQLite로 남긴다.
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

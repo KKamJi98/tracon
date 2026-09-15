@@ -12,6 +12,9 @@ pub fn resume_command(session: &Session) -> String {
     let bin = match session.key.provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
+        // agy는 대화 id로 되살리는 플래그를 공개하지 않는다. 명령 이름만 내보내고
+        // 없는 플래그를 지어내지 않는다.
+        Provider::Antigravity => return "agy".to_string(),
     };
     format!("{bin} --resume {}", session.key.uuid)
 }

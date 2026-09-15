@@ -78,7 +78,8 @@ The red is there to say *this session is asking for you*; a session you finished
 reading twenty minutes ago and walked away from is not that, and leaving it red
 wears the colour out.
 
-`AGENT` says which agent the session belongs to - `claude` or `codex`. The
+`AGENT` says which agent the session belongs to - `claude`, `codex` or `agy`
+(Antigravity CLI), named after the command you type. The
 MODEL column usually implies it, but not always: a session whose model tracon
 has not read yet shows `-` there, and that is exactly when you need to know.
 
@@ -88,6 +89,24 @@ wins over the generated one. That name is what tells two sessions in the same
 PROJECT apart. tracon reads it out of the transcript and never invents one from
 the conversation, so a session with no name yet shows `-`, and so does every
 codex session, because codex does not record one.
+
+## Antigravity
+
+Antigravity CLI keeps a conversation in a SQLite file rather than a transcript,
+and what is inside is schema-less protobuf, so this one reads differently from
+the other two. It also gives up something the others do not: a running `agy`
+holds `brain/<conversation-id>/` open, so the process and the conversation are
+tied together as a fact instead of a guess.
+
+Model and context usage are decoded out of the conversation's `gen_metadata`.
+That layout was observed, not published, so every field is dropped rather than
+guessed at when it does not look right. The session name stays `-` while a
+conversation is in progress: Antigravity only writes a title into its summary
+database once the conversation is over, and tracon will not invent one from the
+conversation itself.
+
+Reading the database needs the `sqlite3` command. Where it is missing, agy rows
+drop out and the rest of tracon carries on, the same way it does without cmux.
 
 ## Works anywhere
 
@@ -128,6 +147,7 @@ lower-confidence guess. Fact-confidence sources always win over inference.
 |---|---|---|---|
 | **claude** | all states, inferred (low/medium confidence) | all states, fact (hook events) | all states, fact |
 | **codex** | all states, inferred; waiting-for-input is fact when the trailing event is `task_complete` | not wired up yet - `tracon hooks install` only installs claude hooks | all states, fact, when cmux forwards codex hook events |
+| **agy** | running or idle, from when the conversation file last moved; model and context read from the conversation database | no hooks | not forwarded |
 
 ## Install
 

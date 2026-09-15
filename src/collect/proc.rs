@@ -39,6 +39,7 @@ pub fn provider_from_argv(argv: &[String]) -> Option<Provider> {
     match name {
         "claude" => Some(Provider::Claude),
         "codex" => Some(Provider::Codex),
+        "agy" => Some(Provider::Antigravity),
         _ => None,
     }
 }

@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod cmux;
 pub mod codex;
 pub mod hooksink;
@@ -44,6 +45,13 @@ pub struct Collector {
     // 이 경우 나머지 전부는 cmux가 존재한 적 없는 것처럼 그대로 동작해야 한다.
     cmux_subscriber: Option<cmux::CmuxSubscriber>,
     cmux_linked: bool,
+    /// Antigravity는 transcript가 없어 위의 배정 기계를 타지 않는다. 실행 중인
+    /// `agy`가 열어 둔 `brain/<uuid>`가 대화를 직접 알려주므로 짐작이 필요 없다.
+    /// `lsof`는 0.15초쯤 걸리니 pid마다 한 번만 부르고 여기 담아 둔다.
+    agy_pid_uuid: std::collections::HashMap<i32, String>,
+    /// 대화별 마지막 읽기 결과와 그때의 활동 시각. SQLite를 tick마다 새로 열 이유가
+    /// 없다 - 파일이 움직였을 때만 다시 읽는다.
+    agy_cache: std::collections::HashMap<String, (i64, antigravity::ConversationInfo)>,
 }
 
 /// `/home/dev/code/app` -> `-home-dev-code-app`
@@ -123,6 +131,8 @@ impl Collector {
             sink_dir: hooksink::sink_dir(),
             cmux_subscriber: None,
             cmux_linked: false,
+            agy_pid_uuid: std::collections::HashMap::new(),
+            agy_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -274,6 +284,8 @@ impl Collector {
             };
             pinned.insert(p.pid);
             let path = match p.provider {
+                // Antigravity는 아래 전용 경로에서 따로 모은다.
+                Provider::Antigravity => continue,
                 Provider::Claude => {
                     let Some(cwd) = p.cwd.as_ref() else {
                         continue;
@@ -306,6 +318,7 @@ impl Collector {
         unclaimed_procs.sort_by_key(|p| p.pid);
         for p in unclaimed_procs {
             let (key, path) = match p.provider {
+                Provider::Antigravity => continue,
                 Provider::Claude => {
                     let Some(cwd) = p.cwd.as_ref() else {
                         continue;
@@ -389,6 +402,8 @@ impl Collector {
                 Some(path) => {
                     let chunk = self.tailer.read_new(path).unwrap_or_default();
                     match key.provider {
+                        // 위에서 걸러져 여기까지 오지 않는다.
+                        Provider::Antigravity => None,
                         Provider::Claude => {
                             let tracker = match self.trackers.entry(path.clone()) {
                                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -421,6 +436,9 @@ impl Collector {
             };
 
             let (state0, conf0) = match key.provider {
+                Provider::Antigravity => {
+                    (crate::model::State::Unknown, crate::model::Confidence::Low)
+                }
                 Provider::Claude => layer0::infer(summary.as_ref(), true, p.cpu, now_ms, &self.cfg),
                 // task_complete가 마지막이면 사실이지 추측이 아니다 - `layer0::infer`가
                 // 텍스트/도구 사용만 보고 매기는 Medium보다 나은 Confidence::Fact를 준다.
@@ -461,6 +479,7 @@ impl Collector {
             let title = summary.as_ref().and_then(|s| s.title.clone());
             let entrypoint = summary.as_ref().and_then(|s| s.entrypoint.clone());
             let ctx_window = match key.provider {
+                Provider::Antigravity => None,
                 // 모델 신원을 봤으면 그게 사실이다. 못 본 세션만 관측값으로 짐작한다.
                 Provider::Claude => window_fact.or_else(|| {
                     ctx_tokens.map(|t| transcript::window_for(model.as_deref().unwrap_or(""), t))
@@ -469,6 +488,7 @@ impl Collector {
                 Provider::Codex => window_fact,
             };
             let cwd = match key.provider {
+                Provider::Antigravity => None,
                 // codex는 session_meta.cwd(rollout 파일 자체가 기록한 값)를 우선한다 -
                 // ChatGPT 앱이 띄운 codex 프로세스는 sysinfo가 cwd를 못 준다.
                 Provider::Codex => self
@@ -494,6 +514,72 @@ impl Collector {
                 cpu: Some(p.cpu),
                 pid: Some(p.pid),
             });
+        }
+
+        // Antigravity는 transcript 대신 대화 SQLite를 쓴다. 프로세스가 열어 둔
+        // brain 디렉터리가 대화를 사실로 알려주므로, 위의 cwd+mtime 짐작을 거치지
+        // 않고 여기서 곧장 행을 만든다.
+        let agy_root = antigravity::root();
+        let agy_procs: Vec<&ProcInfo> = live
+            .iter()
+            .filter(|p| p.provider == Provider::Antigravity)
+            .collect();
+        if !agy_procs.is_empty() {
+            let titles = antigravity::titles(&agy_root);
+            let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
+            for p in agy_procs {
+                seen.insert(p.pid);
+                let uuid = match self.agy_pid_uuid.get(&p.pid) {
+                    Some(u) => u.clone(),
+                    None => match antigravity::conversation_for_pid(p.pid) {
+                        Some(u) => {
+                            self.agy_pid_uuid.insert(p.pid, u.clone());
+                            u
+                        }
+                        // 아직 대화를 열지 않은 프로세스다. 다음 tick에 다시 본다.
+                        None => continue,
+                    },
+                };
+                let last_ms =
+                    antigravity::last_activity_ms(&agy_root, &uuid).unwrap_or(p.started_at_ms);
+                // 파일이 움직였을 때만 다시 읽는다 - SQLite를 tick마다 열 이유가 없다.
+                let info = match self.agy_cache.get(&uuid) {
+                    Some((seen_at, info)) if *seen_at == last_ms => info.clone(),
+                    _ => {
+                        let fresh =
+                            antigravity::read_conversation(&agy_root, &uuid).unwrap_or_default();
+                        self.agy_cache
+                            .insert(uuid.clone(), (last_ms, fresh.clone()));
+                        fresh
+                    }
+                };
+                let (state, confidence) = antigravity::infer(now_ms - last_ms, &self.cfg);
+                sessions.push(Session {
+                    key: SessionKey {
+                        provider: Provider::Antigravity,
+                        uuid: uuid.clone(),
+                    },
+                    state,
+                    source: Source::Layer0Inferred,
+                    confidence,
+                    last_change_ms: last_ms,
+                    started_at_ms: Some(p.started_at_ms),
+                    cwd: p.cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
+                    title: titles.get(&uuid).cloned(),
+                    // agy 세션은 사람이 터미널에서 띄운다. SDK 판별 대상이 아니다.
+                    entrypoint: Some("cli".to_string()),
+                    ctx_window: info.ctx_window,
+                    ctx_tokens: info.ctx_tokens,
+                    model: info.model.clone(),
+                    cpu: Some(p.cpu),
+                    pid: Some(p.pid),
+                });
+            }
+            // 사라진 프로세스의 캐시는 버린다.
+            self.agy_pid_uuid.retain(|pid, _| seen.contains(pid));
+            let live_uuids: std::collections::HashSet<String> =
+                self.agy_pid_uuid.values().cloned().collect();
+            self.agy_cache.retain(|uuid, _| live_uuids.contains(uuid));
         }
 
         sort_sessions(&mut sessions);
