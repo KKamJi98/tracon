@@ -2,8 +2,30 @@
 
 Approach control for your agent sessions. See who is holding, and go to them.
 
-tracon lists every AI coding agent session running on your machine, tells you
-which ones are waiting on you, and takes you there.
+tracon is a terminal dashboard for the AI coding agent sessions running on your
+own machine. It finds every live `claude` and `codex` session, shows which ones
+are waiting on you and which are still working, how much of each context window
+is gone, and takes you to the session you pick. Think htop, but the processes
+are agents and the thing you are scanning for is which one needs you.
+
+It reads what is already on disk and in the process table - no daemon, no
+account, nothing leaves your machine.
+
+## The name
+
+tracon is named after TRACON, Terminal Radar Approach Control: the air traffic
+facility that owns the airspace around an airport, between en-route control and
+the tower. A TRACON controller does three things at once - watches every
+aircraft in the area on a single scope, decides the order they get handled, and
+hands each one off to whoever takes it next.
+
+That is the job here. Every agent session on your machine shows up on one
+screen, the ones that need you sort to the top, and enter hands you off to the
+session itself. The tagline borrows the vocabulary too: an aircraft told to wait
+for clearance is *holding*, which is exactly what a session sitting on an
+approval prompt is doing.
+
+It is pronounced TRAY-con.
 
 ## What it does
 
