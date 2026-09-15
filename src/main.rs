@@ -4,9 +4,9 @@ mod collect;
 mod config;
 mod hooks;
 mod json;
-mod jump;
 mod merge;
 mod model;
+mod resume;
 mod ui;
 
 use anyhow::Context;
@@ -76,6 +76,9 @@ fn run_hook_event(provider: &str) -> anyhow::Result<()> {
         return Ok(());
     };
     record.key.provider = parse_provider(provider);
+    // 훅 payload에는 pid가 없다. 조상 체인에서 찾아 채워 두면 Collector가 프로세스와
+    // 세션을 짐작 대신 사실로 맞출 수 있다.
+    record.pid = crate::collect::hooksink::agent_ancestor_pid();
     let dir = crate::collect::hooksink::sink_dir();
     let _ = crate::collect::hooksink::record_event(&dir, &record);
     Ok(())
@@ -128,14 +131,11 @@ fn run_json() -> anyhow::Result<()> {
     // `spawn_one_shot()`을 쓴다 - 계속 재연결을 시도하는 구독을 한 번 쓰고
     // 버릴 이유가 없다.
     let cmux = crate::collect::cmux::CmuxSubscriber::spawn_one_shot();
-    let cmux_jumper = cmux.is_some().then(crate::jump::cmux::CmuxJumper::new);
     let mut collector = crate::collect::Collector::new(
         Box::new(crate::collect::proc::SysProcessSource::new()),
         crate::config::Thresholds::default(),
     )
-    .with_jumpers(vec![Box::new(crate::jump::tmux::TmuxJumper::new())])
-    .with_cmux(cmux)
-    .with_cmux_jumper(cmux_jumper);
+    .with_cmux(cmux);
     let snapshot = collector.snapshot(crate::collect::hooksink::now_ms());
     // 스냅샷을 찍은 즉시 collector를 버려 cmux 구독(있다면)을 명시적으로 끊는다 -
     // 프로세스 종료에 기대지 않는다. 그러지 않으면 이 호출이 statusline처럼

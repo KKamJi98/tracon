@@ -132,12 +132,17 @@ pub struct Session {
     pub last_change_ms: i64,
     pub started_at_ms: Option<i64>,
     pub cwd: Option<String>,
+    /// 세션에 붙은 이름(claude의 `ai-title`/`custom-title`). 이름이 없거나 아직
+    /// tail에서 못 본 세션은 `None`이다.
+    pub title: Option<String>,
+    /// 이 세션을 몬 주체(`cli` = 사람이 터미널에서, `sdk-py` 등 = 프로그램이).
+    /// 모르면 `None`이고, 그때는 사람이 쓰는 세션으로 취급한다.
+    pub entrypoint: Option<String>,
     pub model: Option<String>,
     pub ctx_tokens: Option<u64>,
     pub ctx_window: Option<u64>,
     pub cpu: Option<f32>,
     pub pid: Option<i32>,
-    pub jump: Option<String>,
 }
 
 impl Session {

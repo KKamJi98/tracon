@@ -35,11 +35,7 @@ pub fn sink_dir() -> PathBuf {
 pub fn record_event(dir: &Path, rec: &SinkRecord) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", sanitize(&rec.key.uuid)));
-    let tmp = dir.join(format!(
-        "{}.json.{}.tmp",
-        sanitize(&rec.key.uuid),
-        std::process::id()
-    ));
+    let tmp = temp_path(dir, &rec.key.uuid, std::process::id());
     std::fs::write(&tmp, serde_json::to_vec(rec)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
@@ -88,6 +84,60 @@ fn sanitize(uuid: &str) -> String {
 }
 
 #[allow(dead_code)]
+/// 훅 프로세스에서 조상을 거슬러 올라가 이 이벤트를 낸 에이전트 프로세스를 찾는다.
+///
+/// 훅 payload에는 pid가 없다. 그런데 pid가 없으면 `Collector`는 살아 있는 프로세스와
+/// 세션 uuid를 cwd와 transcript mtime으로 짐작해 맞출 수밖에 없고, 같은 cwd에 세션이
+/// 여러 개면 닫힌 세션의 transcript를 살아 있는 다른 프로세스가 집어간다. 훅은 에이전트의
+/// 자손으로 실행되므로, 조상 체인이 그 연결을 사실로 만들어 준다.
+///
+/// 실측 체인은 `tracon -> bash(래퍼) -> zsh -> claude`로 3~4홉이다. 8홉에서 끊어
+/// 어떤 경우에도 순환이나 긴 탐색으로 훅을 지연시키지 않는다. 못 찾으면 `None`이고,
+/// 호출부는 pid 없는 기록을 그대로 남긴다 - 짐작 경로로 돌아갈 뿐 나빠지지 않는다.
+pub fn agent_ancestor_pid() -> Option<i32> {
+    let table = ps_table()?;
+    let mut pid = std::process::id() as i32;
+    for _ in 0..8 {
+        let (ppid, comm) = table.get(&pid)?;
+        if is_agent_comm(comm) {
+            return Some(pid);
+        }
+        pid = *ppid;
+    }
+    None
+}
+
+/// `ps -eo pid=,ppid=,comm=` 한 번으로 전체 표를 읽는다. 홉마다 `ps`를 새로 띄우면
+/// 훅 이벤트 하나에 spawn이 서너 개씩 붙는다 - 훅은 도구 호출마다 돈다.
+fn ps_table() -> Option<std::collections::HashMap<i32, (i32, String)>> {
+    let out = std::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid=,comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_ps_table(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_ps_table(text: &str) -> std::collections::HashMap<i32, (i32, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid: i32 = parts.next()?.parse().ok()?;
+            let ppid: i32 = parts.next()?.parse().ok()?;
+            let comm = parts.next()?.to_string();
+            Some((pid, (ppid, comm)))
+        })
+        .collect()
+}
+
+/// `comm`은 실행 파일 경로일 수도, 이름만일 수도 있다. 마지막 경로 요소로 본다.
+fn is_agent_comm(comm: &str) -> bool {
+    let name = comm.rsplit('/').next().unwrap_or(comm);
+    name == "claude" || name == "codex"
+}
+
 fn temp_path(dir: &Path, uuid: &str, pid: u32) -> PathBuf {
     dir.join(format!("{}.json.{}.tmp", sanitize(uuid), pid))
 }
@@ -142,6 +192,30 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::model::{HookEvent, Provider};
+
+    /// `ps -eo pid=,ppid=,comm=` 출력에서 부모 관계를 읽는다. comm에 경로가 붙어
+    /// 나오는 환경이 있어 마지막 경로 요소로 판정한다.
+    #[test]
+    fn ps_table_parses_parent_links() {
+        let out = "  100     1 /bin/login\n  200   100 -zsh\n  300   200 /usr/bin/claude\n";
+        let m = super::parse_ps_table(out);
+        assert_eq!(m.get(&300).map(|(p, _)| *p), Some(200));
+        assert_eq!(m.get(&200).map(|(p, _)| *p), Some(100));
+        assert!(super::is_agent_comm("/usr/bin/claude"));
+        assert!(super::is_agent_comm("claude"));
+        assert!(super::is_agent_comm("codex"));
+        assert!(!super::is_agent_comm("-zsh"));
+        assert!(!super::is_agent_comm("/bin/login"));
+    }
+
+    /// 조상에 에이전트가 정말 있으면 찾아낸다. 이 테스트 프로세스는 claude가 띄운
+    /// `cargo test`의 자손이 아닐 수도 있으므로, 순수 파싱 경로만 검증한다.
+    #[test]
+    fn a_chain_without_an_agent_yields_nothing() {
+        let out = "  100     1 /bin/login\n  200   100 -zsh\n";
+        let m = super::parse_ps_table(out);
+        assert!(!m.values().any(|(_, c)| super::is_agent_comm(c)));
+    }
 
     #[test]
     fn parses_claude_hook_stdin() {

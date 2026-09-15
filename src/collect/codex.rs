@@ -192,6 +192,9 @@ pub struct CodexTracker {
     usage: Option<Usage>,
     context_window: Option<u64>,
     meta_cwd: Option<String>,
+    /// `turn_context`가 밝히는 모델 이름. codex는 claude와 달리 응답 엔트리에
+    /// 모델을 적지 않아, 이 줄을 안 보면 MODEL 열이 영영 `-`로 남는다.
+    model: Option<String>,
     /// 가장 최근에 본 "의미 있는" 엔트리가 `task_complete`였는지. 그 뒤로 새
     /// `response_item`이나 `task_started`가 오면 꺼진다 - "마지막이 task_complete"라는
     /// 사실만 잡아내면 된다.
@@ -226,6 +229,15 @@ impl CodexTracker {
             "session_meta" => {
                 if let Some(cwd) = payload.and_then(|p| p.get("cwd")).and_then(|c| c.as_str()) {
                     self.meta_cwd = Some(cwd.to_string());
+                }
+            }
+            // 턴마다 다시 적힌다 - `/model`로 바꾸면 그때부터 새 이름이 온다.
+            "turn_context" => {
+                if let Some(model) = payload
+                    .and_then(|p| p.get("model"))
+                    .and_then(|m| m.as_str())
+                {
+                    self.model = Some(model.to_string());
                 }
             }
             "response_item" => self.apply_response_item(payload, ts_ms),
@@ -318,8 +330,11 @@ impl CodexTracker {
             last_ts_ms: latest.ts_ms,
             pending_tool_use: self.pending.len(),
             usage: self.usage,
-            model: None,
+            model: self.model.clone(),
             cwd: self.meta_cwd.clone(),
+            // codex rollout은 세션 이름도 entrypoint도 남기지 않는다.
+            title: None,
+            entrypoint: None,
         })
     }
 
@@ -370,6 +385,21 @@ mod tests {
     use super::*;
 
     const TAIL: &str = include_str!("../../tests/fixtures/codex_tail.jsonl");
+
+    /// codex는 응답 엔트리에 모델을 적지 않는다 - 턴마다 나오는 `turn_context`만
+    /// 밝힌다. 그 줄을 안 보면 codex 세션의 MODEL 열이 영영 `-`로 남는다.
+    #[test]
+    fn turn_context_supplies_the_model_name() {
+        const TURN: &str = r#"{"type":"turn_context","timestamp":"2026-09-15T00:00:10.000Z","ordinal":7,"payload":{"cwd":"/home/dev/app","model":"gpt-6-astra","effort":"medium"}}"#;
+        const ASSISTANT: &str = r#"{"type":"response_item","timestamp":"2026-09-15T00:00:20.000Z","ordinal":8,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#;
+        let mut tr = CodexTracker::new();
+        tr.apply(TURN);
+        tr.apply(ASSISTANT);
+        assert_eq!(
+            tr.summary().expect("summary").model.as_deref(),
+            Some("gpt-6-astra")
+        );
+    }
 
     #[test]
     fn finds_uuid_in_rollout_filename() {
@@ -588,6 +618,8 @@ mod tests {
             usage: None,
             model: None,
             cwd: None,
+            title: None,
+            entrypoint: None,
         };
         let (s, c) = infer(Some(&tail), true, true, 0.0, 6_000, &cfg);
         assert_eq!(s, State::WaitingInput);
@@ -604,6 +636,8 @@ mod tests {
             usage: None,
             model: None,
             cwd: None,
+            title: None,
+            entrypoint: None,
         };
         // idle cpu + 오래됨 -> claude와 같은 방식으로 승인 대기를 "의심"만 한다
         // (관측이 아니라 추론이므로 Low로 남는다).

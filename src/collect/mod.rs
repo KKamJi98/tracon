@@ -9,7 +9,6 @@ pub mod transcript;
 use crate::collect::proc::{ProcInfo, ProcessSource};
 use crate::config::Thresholds;
 use crate::json::{sort_sessions, Snapshot};
-use crate::jump::Jumper;
 use crate::merge::winner;
 use crate::model::{Observation, Provider, Session, SessionKey, Source};
 use std::path::{Path, PathBuf};
@@ -41,17 +40,10 @@ pub struct Collector {
     // 두 세션이 번갈아 쓸 때 tick마다 배정이 맞바뀐다.
     claude_pid_uuid: std::collections::HashMap<i32, String>,
     sink_dir: PathBuf,
-    // tmux list-panes 같은 비용이 드는 조회는 tick당 딱 한 번(refresh)만 하고,
-    // 세션마다 하는 resolve_tty는 그 캐시를 읽는 순수 조회다.
-    jumpers: Vec<Box<dyn Jumper>>,
     // 레이어 2(cmux). None이면 cmux가 없거나 아직 연결을 시도하지 않은 것 -
     // 이 경우 나머지 전부는 cmux가 존재한 적 없는 것처럼 그대로 동작해야 한다.
     cmux_subscriber: Option<cmux::CmuxSubscriber>,
     cmux_linked: bool,
-    cmux_jumper: Option<crate::jump::cmux::CmuxJumper>,
-    // 세션마다 마지막으로 본 cmux workspace_id. cmux 이벤트가 tick마다 오지는
-    // 않으므로(trackers/tailer와 같은 이유로) 점프 대상을 잃지 않으려면 유지해야 한다.
-    cmux_workspaces: std::collections::HashMap<SessionKey, String>,
 }
 
 /// `/home/dev/code/app` -> `-home-dev-code-app`
@@ -129,11 +121,8 @@ impl Collector {
             codex_pid_uuid: std::collections::HashMap::new(),
             claude_pid_uuid: std::collections::HashMap::new(),
             sink_dir: hooksink::sink_dir(),
-            jumpers: Vec::new(),
             cmux_subscriber: None,
             cmux_linked: false,
-            cmux_jumper: None,
-            cmux_workspaces: std::collections::HashMap::new(),
         }
     }
 
@@ -194,13 +183,6 @@ impl Collector {
         self
     }
 
-    /// 점프 대상을 찾아낼 소스를 등록한다. 테스트는 가짜 Jumper를 주입해 tmux를
-    /// 실제로 띄우지 않고도 resolve_tty 경로를 검증할 수 있다.
-    pub fn with_jumpers(mut self, jumpers: Vec<Box<dyn Jumper>>) -> Self {
-        self.jumpers = jumpers;
-        self
-    }
-
     /// cmux 이벤트 구독을 연결한다. `CmuxSubscriber::spawn()`/`spawn_one_shot()`이
     /// 돌려준 값이다. `None`이면(cmux 없음) 레이어 2는 계속 비활성으로 남는다.
     /// `Collector`가 이 값을 들고 있다가 버려질 때 - 예를 들어 `--json`처럼
@@ -213,28 +195,10 @@ impl Collector {
         self
     }
 
-    /// workspace 점프 대상을 찾아낼 cmux 어댑터를 등록한다. `None`이면(cmux 구독이
-    /// 없음) 세션은 tty 기반 Jumper로만 점프 대상을 찾는다.
-    #[allow(dead_code)]
-    pub fn with_cmux_jumper(mut self, jumper: Option<crate::jump::cmux::CmuxJumper>) -> Self {
-        self.cmux_jumper = jumper;
-        self
-    }
-
     pub fn snapshot(&mut self, now_ms: i64) -> Snapshot {
         let live: Vec<ProcInfo> = self.procs.list_agents();
         let sink_records = hooksink::read_all(&self.sink_dir);
         let hooks_installed = !sink_records.is_empty();
-
-        // tmux list-panes 같은 비용이 드는 조회는 세션 수와 무관하게 tick당 한 번만
-        // 한다. 아래에서 세션마다 부르는 resolve_tty는 이 캐시를 읽기만 하는 순수
-        // 조회라 20세션이어도 새 프로세스가 늘지 않는다.
-        for jumper in &mut self.jumpers {
-            jumper.refresh();
-        }
-        if let Some(jumper) = &mut self.cmux_jumper {
-            jumper.refresh();
-        }
 
         // 이번 tick에 새로 들어온 cmux 이벤트를 전부 비운다. `Empty`는 "당장은
         // 없음"이라 링크가 살아있다고 본다. `Disconnected`는 구독 스레드가 죽었다는
@@ -265,10 +229,6 @@ impl Collector {
         let mut cmux_by_key: std::collections::HashMap<SessionKey, Vec<Observation>> =
             std::collections::HashMap::new();
         for ev in &cmux_events {
-            if let Some(id) = &ev.workspace_id {
-                self.cmux_workspaces
-                    .insert(ev.record.key.clone(), id.clone());
-            }
             if let Some(obs) = ev.to_observation() {
                 cmux_by_key.entry(obs.key.clone()).or_default().push(obs);
             }
@@ -283,12 +243,36 @@ impl Collector {
         let mut by_key: std::collections::HashMap<SessionKey, (ProcInfo, Option<PathBuf>)> =
             std::collections::HashMap::new();
 
-        // 1단계: session_id가 명시된 프로세스는 자기 transcript를 그대로 차지한다.
-        // 이 배정은 2단계보다 먼저 끝나므로 live 벡터 안에서의 순서와 무관하게 우선한다.
+        // 훅이 적어 둔 pid -> uuid. 훅 payload에는 pid가 없어서 훅이 자기 조상 체인을
+        // 거슬러 올라가 찾아 넣은 값이다. argv의 `--session-id`와 같은 급의 사실이므로
+        // 2단계의 cwd+mtime 짐작보다 먼저 쓴다. 같은 pid에 기록이 여러 건이면 최신 것.
+        let mut hook_pid_uuid: std::collections::HashMap<i32, (i64, String)> =
+            std::collections::HashMap::new();
+        for r in &sink_records {
+            let Some(pid) = r.pid else { continue };
+            let slot = hook_pid_uuid
+                .entry(pid)
+                .or_insert((i64::MIN, String::new()));
+            if r.occurred_at >= slot.0 {
+                *slot = (r.occurred_at, r.key.uuid.clone());
+            }
+        }
+
+        // 1단계: 세션이 사실로 밝혀진 프로세스는 자기 transcript를 그대로 차지한다.
+        // argv의 `--session-id`나 훅 기록 둘 중 하나면 된다. 이 배정은 2단계보다 먼저
+        // 끝나므로 live 벡터 안에서의 순서와 무관하게 우선한다.
+        let mut pinned: std::collections::HashSet<i32> = std::collections::HashSet::new();
         for p in &live {
-            let Some(id) = p.session_id.as_ref() else {
+            let known = p.session_id.clone().or_else(|| {
+                hook_pid_uuid
+                    .get(&p.pid)
+                    .filter(|_| p.provider == Provider::Claude)
+                    .map(|(_, uuid)| uuid.clone())
+            });
+            let Some(id) = known.as_ref() else {
                 continue;
             };
+            pinned.insert(p.pid);
             let path = match p.provider {
                 Provider::Claude => {
                     let Some(cwd) = p.cwd.as_ref() else {
@@ -315,8 +299,10 @@ impl Collector {
         // transcript 중 가장 최근 것을 하나씩 가져간다. 남은 transcript가 없어도
         // 세션을 숨기지 않고 Unknown으로 띄운다. pid로 먼저 정렬해 배정이 live 벡터의
         // 원래 순서(sysinfo의 HashMap 순회 등, 보장되지 않는다)에 좌우되지 않게 한다.
-        let mut unclaimed_procs: Vec<&ProcInfo> =
-            live.iter().filter(|p| p.session_id.is_none()).collect();
+        let mut unclaimed_procs: Vec<&ProcInfo> = live
+            .iter()
+            .filter(|p| p.session_id.is_none() && !pinned.contains(&p.pid))
+            .collect();
         unclaimed_procs.sort_by_key(|p| p.pid);
         for p in unclaimed_procs {
             let (key, path) = match p.provider {
@@ -396,21 +382,37 @@ impl Collector {
         let mut sessions = Vec::new();
         for (key, (p, path)) in &by_key {
             let mut turn_ended = false;
-            let mut codex_window: Option<u64> = None;
+            // 모델 신원에서 읽어낸 컨텍스트 윈도우. 관측 토큰 수로 짐작하는
+            // 폴백보다 우선한다.
+            let mut window_fact: Option<u64> = None;
             let summary = match path {
                 Some(path) => {
                     let chunk = self.tailer.read_new(path).unwrap_or_default();
                     match key.provider {
                         Provider::Claude => {
-                            let tracker = self.trackers.entry(path.clone()).or_default();
+                            let tracker = match self.trackers.entry(path.clone()) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                // 처음 보는 transcript다. 모델 신원은 파일 첫머리에
+                                // 한 번만 적히고 다시 나오지 않으므로, 끝만 보는
+                                // Tailer로는 영영 못 만난다 - 여기서 앞부분을 딱 한 번
+                                // 읽는다. 대화 엔트리는 일부러 건드리지 않는다.
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    let mut fresh = transcript::TranscriptTracker::new();
+                                    if let Ok(head) = tail::read_head(path) {
+                                        fresh.apply_meta(&head);
+                                    }
+                                    e.insert(fresh)
+                                }
+                            };
                             tracker.apply(&chunk);
+                            window_fact = tracker.context_window();
                             tracker.summary()
                         }
                         Provider::Codex => {
                             let tracker = self.codex_trackers.entry(path.clone()).or_default();
                             tracker.apply(&chunk);
                             turn_ended = tracker.turn_ended();
-                            codex_window = tracker.context_window();
+                            window_fact = tracker.context_window();
                             tracker.summary()
                         }
                     }
@@ -456,13 +458,15 @@ impl Collector {
             let last_change = summary.as_ref().map(|s| s.last_ts_ms).unwrap_or(now_ms);
             let ctx_tokens = summary.as_ref().and_then(|s| s.usage.map(|u| u.total()));
             let model = summary.as_ref().and_then(|s| s.model.clone());
+            let title = summary.as_ref().and_then(|s| s.title.clone());
+            let entrypoint = summary.as_ref().and_then(|s| s.entrypoint.clone());
             let ctx_window = match key.provider {
-                // claude는 모델이 윈도우 크기를 밝히지 않아 관측값으로 짐작한다.
-                Provider::Claude => {
+                // 모델 신원을 봤으면 그게 사실이다. 못 본 세션만 관측값으로 짐작한다.
+                Provider::Claude => window_fact.or_else(|| {
                     ctx_tokens.map(|t| transcript::window_for(model.as_deref().unwrap_or(""), t))
-                }
+                }),
                 // codex는 token_count 이벤트가 윈도우를 직접 알려주므로 짐작하지 않는다.
-                Provider::Codex => codex_window,
+                Provider::Codex => window_fact,
             };
             let cwd = match key.provider {
                 // codex는 session_meta.cwd(rollout 파일 자체가 기록한 값)를 우선한다 -
@@ -474,21 +478,6 @@ impl Collector {
                     .or_else(|| p.cwd.as_ref().map(|c| c.to_string_lossy().into_owned())),
                 Provider::Claude => p.cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
             };
-            // cmux가 workspace_id를 사실로 주면 그쪽을 우선한다 - tty 기반 Jumper는
-            // cmux 없이도 동작해야 하는 폴백이다.
-            let cmux_jump = self.cmux_workspaces.get(key).and_then(|wsid| {
-                self.cmux_jumper
-                    .as_ref()
-                    .and_then(|jumper| jumper.resolve(wsid))
-            });
-            let jump = cmux_jump.or_else(|| {
-                p.tty.as_deref().and_then(|tty| {
-                    self.jumpers
-                        .iter()
-                        .find_map(|jumper| jumper.resolve_tty(tty))
-                })
-            });
-
             sessions.push(Session {
                 key: key.clone(),
                 state: crate::model::demote(win.state, now_ms - last_change, &self.cfg),
@@ -497,12 +486,13 @@ impl Collector {
                 last_change_ms: last_change,
                 started_at_ms: Some(p.started_at_ms),
                 cwd,
+                title,
+                entrypoint,
                 ctx_window,
                 ctx_tokens,
                 model,
                 cpu: Some(p.cpu),
                 pid: Some(p.pid),
-                jump: jump.map(|t| t.label()),
             });
         }
 
@@ -534,10 +524,6 @@ impl Collector {
         // 세션의 경로를 무한정 들고 있으면 장시간 폴링에서 메모리가 계속 는다.
         self.codex_paths
             .retain(|_, (path, _)| claimed.contains(path));
-        // by_key는 이번 tick에 실제로 화면에 오른 세션 키만 담는다 - trackers/tailer와
-        // 같은 이유로, 더는 없는 세션의 workspace_id를 무한정 들고 있지 않는다.
-        self.cmux_workspaces
-            .retain(|key, _| by_key.contains_key(key));
         // 훅 기록 파일도 같은 이유로 정리한다. 살아 있는 프로세스가 아무도 가리키지
         // 않은 세션의 기록은 다시 쓰일 일이 없다.
         let live_uuids: std::collections::HashSet<String> =
@@ -577,7 +563,6 @@ mod tests {
             cwd: Some(PathBuf::from(cwd)),
             cpu,
             started_at_ms: NOW - 3_600_000,
-            tty: None,
         }
     }
 
@@ -746,6 +731,54 @@ mod tests {
         assert_eq!(left[0].key.uuid, "u1");
     }
 
+    /// 세션을 닫으면 그 transcript는 그 cwd에서 가장 최근 것이 된다. `--session-id`
+    /// 없이 떠 있는 다른 프로세스가 짐작으로 그걸 집어가고, 닫은 세션의 이름이
+    /// 살아 있는 행에 계속 붙는다. 닫힐 때 훅이 남긴 `SessionEnd`가 그 행을 Dead로
+    /// 만들어 기본 목록에서 접히게 한다.
+    #[test]
+    fn a_closed_session_reads_as_dead_even_if_another_process_grabs_its_transcript() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        std::fs::write(proj.join("closed.jsonl"), "").expect("write");
+
+        let sink = tempfile::tempdir().expect("sink");
+        crate::collect::hooksink::record_event(
+            sink.path(),
+            &crate::collect::hooksink::SinkRecord {
+                key: crate::model::SessionKey {
+                    provider: crate::model::Provider::Claude,
+                    uuid: "closed".into(),
+                },
+                event: crate::model::HookEvent::SessionEnd,
+                occurred_at: NOW - 1_000,
+                cwd: Some("/home/dev/app".into()),
+                pid: None,
+            },
+        )
+        .expect("record");
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc_with(300, None, "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf())
+        .with_sink_dir(sink.path().to_path_buf());
+
+        let snap = c.snapshot(NOW);
+        let row = snap
+            .sessions
+            .iter()
+            .find(|s| s.key.uuid == "closed")
+            .expect("closed 세션");
+        assert_eq!(
+            row.state,
+            State::Dead,
+            "닫힌 세션이 살아 있는 행으로 계속 보인다"
+        );
+        assert_eq!(row.source, crate::model::Source::Layer1Hook);
+    }
+
     #[test]
     fn dead_sessions_from_sink_are_dropped_when_process_is_gone() {
         let dir = tempfile::tempdir().expect("dir");
@@ -770,6 +803,63 @@ mod tests {
             .with_sink_dir(sink);
         let snap = c.snapshot(NOW);
         assert!(snap.sessions.is_empty());
+    }
+
+    /// `--session-id` 없이 뜬 프로세스는 cwd + mtime 짐작으로 transcript를 배정받는다.
+    /// 같은 cwd에 세션이 여러 개면 그 짐작이 틀려서, 닫힌 세션의 이름이 살아 있는
+    /// 다른 행에 붙는다. 훅이 조상 체인에서 찾아 적어 둔 pid가 그 짐작을 끊는다.
+    #[test]
+    fn a_hook_record_pins_the_session_to_its_real_process() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        // mtime 순서상 짐작은 bbb를 먼저 집는다. 훅은 200번이 aaa라고 말한다.
+        std::fs::write(proj.join("aaa.jsonl"), "").expect("write aaa");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(proj.join("bbb.jsonl"), "").expect("write bbb");
+
+        let sink = tempfile::tempdir().expect("sink");
+        let rec = crate::collect::hooksink::SinkRecord {
+            key: crate::model::SessionKey {
+                provider: crate::model::Provider::Claude,
+                uuid: "aaa".into(),
+            },
+            event: crate::model::HookEvent::Stop,
+            occurred_at: NOW - 1_000,
+            cwd: Some("/home/dev/app".into()),
+            pid: Some(200),
+        };
+        crate::collect::hooksink::record_event(sink.path(), &rec).expect("record");
+
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![
+                proc_with(200, None, "/home/dev/app", 0.0),
+                proc_with(201, None, "/home/dev/app", 0.0),
+            ])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf())
+        .with_sink_dir(sink.path().to_path_buf());
+
+        let snap = c.snapshot(NOW);
+        let pinned = snap
+            .sessions
+            .iter()
+            .find(|s| s.pid == Some(200))
+            .expect("200번 세션");
+        assert_eq!(
+            pinned.key.uuid, "aaa",
+            "훅이 말해 준 세션 대신 mtime 짐작을 따랐다"
+        );
+        let other = snap
+            .sessions
+            .iter()
+            .find(|s| s.pid == Some(201))
+            .expect("201번 세션");
+        assert_eq!(
+            other.key.uuid, "bbb",
+            "남은 프로세스가 남은 transcript를 가져야 한다"
+        );
     }
 
     #[test]
@@ -971,66 +1061,6 @@ mod tests {
         assert_eq!(second.sessions[0].state, State::RunningInference);
     }
 
-    struct FakeJumper {
-        panes: std::collections::HashMap<String, String>,
-        refresh_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    }
-
-    impl crate::jump::Jumper for FakeJumper {
-        fn refresh(&mut self) {
-            self.refresh_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        fn resolve_tty(&self, tty: &str) -> Option<crate::jump::JumpTarget> {
-            self.panes
-                .get(tty)
-                .cloned()
-                .map(crate::jump::JumpTarget::Tmux)
-        }
-    }
-
-    #[test]
-    fn jump_label_is_filled_from_injected_jumper_and_refreshed_once_per_snapshot() {
-        let dir = tempfile::tempdir().expect("dir");
-        let mut panes = std::collections::HashMap::new();
-        panes.insert("/dev/ttys004".to_string(), "main:2.1".to_string());
-        let refresh_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let jumper = FakeJumper {
-            panes,
-            refresh_calls: refresh_calls.clone(),
-        };
-
-        let mut p1 = proc_with(100, Some("u1"), "/home/dev/app", 0.0);
-        p1.tty = Some("/dev/ttys004".to_string());
-        let mut p2 = proc_with(101, Some("u2"), "/home/dev/app2", 0.0);
-        p2.tty = Some("/dev/ttys999".to_string());
-
-        let mut c = super::Collector::new(Box::new(FakeProcs(vec![p1, p2])), Thresholds::default())
-            .with_projects_root(dir.path().to_path_buf())
-            .with_jumpers(vec![Box::new(jumper)]);
-
-        let snap = c.snapshot(NOW);
-
-        let s1 = snap
-            .sessions
-            .iter()
-            .find(|s| s.key.uuid == "u1")
-            .expect("u1 present");
-        assert_eq!(s1.jump.as_deref(), Some("tmux:main:2.1"));
-
-        let s2 = snap
-            .sessions
-            .iter()
-            .find(|s| s.key.uuid == "u2")
-            .expect("u2 present");
-        assert_eq!(s2.jump, None, "unknown tty must not get a jump target");
-
-        // refresh는 세션이 몇 개든 tick당 한 번만 불려야 한다 - list-panes를
-        // 세션마다 새로 띄우면 20세션에서 spawn이 20배로 늘어 성능 예산을 깬다.
-        assert_eq!(refresh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
     #[test]
     fn tracker_and_offset_entries_are_pruned_once_the_process_is_gone() {
         let dir = tempfile::tempdir().expect("dir");
@@ -1077,7 +1107,6 @@ mod tests {
             cwd: cwd.map(PathBuf::from),
             cpu,
             started_at_ms: NOW - 3_600_000,
-            tty: None,
         }
     }
 

@@ -2,6 +2,31 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+/// transcript 앞부분에서 읽어들일 최대 바이트. claude는 세션을 시작할 때 모델
+/// 신원(`modelId`)을 한 번만 적고 다시 적지 않으므로, 끝만 보는 `Tailer`로는 그
+/// 줄을 절대 만나지 못한다. 실측에서 그 줄은 파일 시작 15KB 안에 있었다.
+pub const HEAD_BYTES: usize = 64 * 1024;
+
+/// 파일 앞에서 최대 `HEAD_BYTES`를, **완결된 줄까지만** 읽는다. 경로마다 한 번만
+/// 부르는 용도다 - `Tailer`처럼 커서를 들고 있지 않는다.
+///
+/// 마지막 개행 뒤에 남은 바이트는 잘린 줄이라 버린다. 그래야 소비자가 반쪽짜리
+/// JSON을 파싱하다 조용히 통째로 버리는 일이 없고, 멀티바이트 문자도 찢기지 않는다.
+pub fn read_head(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(HEAD_BYTES);
+    file.by_ref()
+        .take(HEAD_BYTES as u64)
+        .read_to_end(&mut buf)?;
+    let end = match buf.iter().rposition(|b| *b == b'\n') {
+        Some(i) => i + 1,
+        // 개행이 하나도 없으면 완결된 줄이 없다는 뜻이다.
+        None => 0,
+    };
+    buf.truncate(end);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// 한 파일에 대해 다음에 어디서부터 읽어야 하는지.
 #[derive(Debug, Clone, Copy)]
 struct Cursor {

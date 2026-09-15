@@ -35,39 +35,71 @@ finished and are waiting for your next message. tracon watches all of them at
 once and puts the ones that need you at the top of the list, in red.
 
 ```
-┌tracon────────────────────────────────────────────────────────────────────────────────┐
-│Waiting 2  Running 1  Idle 1  Stale 0   ctx over 85%: 1   hooks on  cmux linked       │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-┌sessions──────────────────────────────────────────────────────────────────────────────┐
-│ST LAST   DUR    CTX%           CPU%  MODEL            PROJECT          JUMP          │
-│WI 3s     41m00s #......  18%   0.0   claude-sonnet-5  kestrel-web      cmux:3        │
-│WA 0s     14m00s ####...  62%   0.0   claude-opus-5    harbor-api       tmux:main:1.2 │
-│RT 1s     5m00s  ###....  44%   38.2  gpt-5-codex      meridian-cli     -             │
-│ID 22m00s 2h     ######.  88% ! 0.0   claude-opus-5    driftwood-infra  -             │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-enter jump   r copy resume   j/k move   q quit
+┌tracon────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Waiting 2  Running 1  Idle 1  Stale 0   ctx over 85%: 1   hooks on  cmux linked                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌sessions──────────────────────────────────────────────────────────────────────────────────────────────┐
+│AGENT  STATE    LAST   DUR    CTX%   CPU%  MODEL            PROJECT         NAME                      │
+│claude waiting  3s     41m00s  18%   0.0   claude-sonnet-5  kestrel-web     checkout flake            │
+│claude approval 0s     14m00s  62%   0.0   claude-opus-5    harbor-api      rate limit rollout        │
+│codex  tool     1s     5m00s   44%   38.2  gpt-6-astra      meridian-cli    -                         │
+│claude idle     22m00s 2h      88% ! 0.0   claude-opus-5    driftwood-infra vpc peering audit         │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+enter/r copy resume   j/k move   q quit
 ```
 
-(That block is a real frame from tracon's own renderer, rendered from sample
-sessions - the PROJECT names are invented, not repositories on anyone's disk.
+(That block is a real frame from tracon's own renderer - `cargo test --
+--ignored --nocapture readme_frame` reprints it - rendered from sample
+sessions. The PROJECT and NAME values are invented, not repositories or
+sessions on anyone's disk.
 Note the ordering: waiting rows sort above the running one, and within the same
 colour the session kept waiting longest comes first. The `!` marks a session
 over 85% of its context window, and the overview line counts those.)
 
-`ST` codes: `WA` waiting for approval, `WI` waiting for input, `RI` running
-inference, `RT` running a tool, `ID` idle, `ST` stale (untouched for a day),
-`DE` dead, `??` unknown. Select a row and press enter to jump to it, or copy
-its `--resume` command if there is nowhere to jump to.
+`STATE` values: `approval` waiting for approval, `waiting` waiting for input,
+`thinking` running inference, `tool` running a tool, `idle`, `stale` (untouched
+for a day), `dead`, `unknown`. Select a row and press enter to copy that
+session's `--resume` command to the clipboard. `ctrl-c` quits, same as `q` -
+raw mode delivers it as a key, not a signal, so tracon has to handle it itself.
+
+Two kinds of session are folded out of the list by default. Ones that have been
+quiet for over a day are still running, but they are not what you opened tracon
+to find. Ones driven by the SDK rather than by a person at a terminal - the
+security-review subagents, for instance - cannot be waiting for you, because
+nobody is sitting in front of them; tracon tells them apart by the `entrypoint`
+the transcript records, and folds anything that is not `cli`. A session whose
+entrypoint tracon has not read yet is left in the list: unknown means human
+here. The footer says how many are folded and `a` toggles them back in. The
+overview counter above keeps counting them either way, so folding hides the
+rows, not the fact.
+
+A finished turn reads as `waiting` for five minutes and then decays to `idle`.
+The red is there to say *this session is asking for you*; a session you finished
+reading twenty minutes ago and walked away from is not that, and leaving it red
+wears the colour out.
+
+`AGENT` says which agent the session belongs to - `claude` or `codex`. The
+MODEL column usually implies it, but not always: a session whose model tracon
+has not read yet shows `-` there, and that is exactly when you need to know.
+
+`NAME` is the session's own name - the same one `claude --resume` lists. It is
+the title claude generated for the session, or the one you set yourself, which
+wins over the generated one. That name is what tells two sessions in the same
+PROJECT apart. tracon reads it out of the transcript and never invents one from
+the conversation, so a session with no name yet shows `-`, and so does every
+codex session, because codex does not record one.
 
 ## Works anywhere
 
 tracon works in any terminal - iTerm2, Ghostty, Terminal.app, a plain ssh
 session. Process inspection and transcript tailing need nothing extra.
 
-tmux and cmux are optional adapters. They do not change what tracon can see;
-they only add a jump target to the `JUMP` column, so pressing enter actually
-switches you to that pane or workspace instead of just printing a
-`--resume` command to copy.
+tracon never tries to move you to a session itself. Switching panes is a
+different command in every terminal and multiplexer, and none of them is
+present everywhere. Enter puts `claude --resume <uuid>` (or `codex --resume`)
+on your clipboard instead, and you decide where to paste it. If no clipboard
+helper is available - `pbcopy`, `wl-copy`, `xclip` - the command is printed in
+the footer so you can still read it off the screen.
 
 ## Three data layers
 
@@ -85,17 +117,17 @@ tracon combines up to three sources per session, and always has a usable one:
   running-a-tool-while-idle stop looking alike.
 - **Layer 2 - cmux (optional, when present).** If cmux is running, tracon
   subscribes to its event stream. This gives the same fact-confidence states
-  as layer 1, for both claude and codex, plus a `cmux:<workspace>` jump
-  target. If cmux is not installed, or its process dies mid-session, tracon
-  falls back to layers 0/1 as if cmux never existed.
+  as layer 1, for both claude and codex. If cmux is not installed, or its
+  process dies mid-session, tracon falls back to layers 0/1 as if cmux never
+  existed.
 
 Layers stack: a session with no hooks and no cmux still shows up, just with a
 lower-confidence guess. Fact-confidence sources always win over inference.
 
 | | Layer 0: process + transcript | Layer 1: tracon hooks | Layer 2: cmux |
 |---|---|---|---|
-| **claude** | all states, inferred (low/medium confidence) | all states, fact (hook events) | all states, fact + jump target |
-| **codex** | all states, inferred; waiting-for-input is fact when the trailing event is `task_complete` | not wired up yet - `tracon hooks install` only installs claude hooks | all states, fact + jump target, when cmux forwards codex hook events |
+| **claude** | all states, inferred (low/medium confidence) | all states, fact (hook events) | all states, fact |
+| **codex** | all states, inferred; waiting-for-input is fact when the trailing event is `task_complete` | not wired up yet - `tracon hooks install` only installs claude hooks | all states, fact, when cmux forwards codex hook events |
 
 ## Install
 

@@ -77,12 +77,13 @@ mod tests {
             last_change_ms: last_change,
             started_at_ms: Some(0),
             cwd: None,
+            title: None,
+            entrypoint: None,
             model: None,
             ctx_tokens: None,
             ctx_window: None,
             cpu: None,
             pid: None,
-            jump: None,
         }
     }
 

@@ -23,8 +23,6 @@ pub struct CmuxEvent {
     /// --cursor-file`이 재연결 재개를 이미 처리하므로 지금은 관측 용도로만 쓴다.
     #[allow(dead_code)]
     pub seq: u64,
-    /// 점프 대상을 찾기 위한 workspace UUID. cmux가 항상 채워 주지는 않는다.
-    pub workspace_id: Option<String>,
 }
 
 impl CmuxEvent {
@@ -56,7 +54,6 @@ struct RawPayload {
     session_id: String,
     hook_event_name: Option<String>,
     cwd: Option<String>,
-    workspace_id: Option<String>,
 }
 
 /// `cmux events` 한 줄(ndjson)을 파싱한다. `category`가 `agent`이고 `name`이
@@ -80,7 +77,6 @@ pub fn parse_cmux_event(line: &str) -> Option<CmuxEvent> {
             pid: None,
         },
         seq: raw.seq,
-        workspace_id: raw.payload.workspace_id,
     })
 }
 
@@ -250,15 +246,6 @@ mod tests {
     fn ignores_non_agent_categories() {
         let line = NDJSON.lines().nth(2).expect("line");
         assert!(parse_cmux_event(line).is_none());
-    }
-
-    #[test]
-    fn extracts_workspace_for_jump() {
-        let e = parse_cmux_event(NDJSON.lines().next().expect("line")).expect("event");
-        assert_eq!(
-            e.workspace_id.as_deref(),
-            Some("BBBB2222-0000-0000-0000-000000000000")
-        );
     }
 
     #[test]
