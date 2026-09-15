@@ -58,6 +58,11 @@ struct RawEntry {
     #[serde(default)]
     #[serde(rename = "isMeta")]
     is_meta: bool,
+    /// claude가 모델을 부르지 않고 직접 적은 알림(세션 한도, 네트워크 끊김 등)에
+    /// 붙는 표시. 모델은 `<synthetic>`이고 usage는 전부 0이다.
+    #[serde(default)]
+    #[serde(rename = "isApiErrorMessage")]
+    is_api_error: bool,
     message: Option<RawMessage>,
 }
 
@@ -107,6 +112,9 @@ impl RawContent {
 
 /// claude가 중단된 응답 자리에 남기는 표식.
 const INTERRUPT_MARKER: &str = "[Request interrupted by user";
+
+/// 모델을 부르지 않고 만들어진 엔트리에 붙는 모델 이름.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 #[derive(Deserialize)]
 struct RawBlock {
@@ -250,6 +258,9 @@ struct LatestEntry {
     model: Option<String>,
     cwd: Option<String>,
     entrypoint: Option<String>,
+    /// 모델을 부르지 않고 만들어진 엔트리. 대화의 일부이긴 하지만 컨텍스트
+    /// 측정값이 아니므로 마지막 실측을 덮으면 안 된다.
+    synthetic: bool,
 }
 
 /// 한 줄을 파싱해 `pending`(미완결 tool_use id 집합)을 갱신하고, sidechain이 아닌
@@ -315,6 +326,7 @@ fn process_line(line: &str, pending: &mut Vec<String>) -> Option<LatestEntry> {
             cache_read: u.cache_read_input_tokens,
             cache_creation: u.cache_creation_input_tokens,
         }),
+        synthetic: entry.is_api_error || message.model.as_deref() == Some(SYNTHETIC_MODEL),
         model: message.model,
         cwd: entry.cwd,
         entrypoint: entry.entrypoint,
@@ -374,11 +386,16 @@ impl TranscriptTracker {
                 if self.entrypoint.is_none() {
                     self.entrypoint = entry.entrypoint.clone();
                 }
-                if entry.usage.is_some() {
-                    self.usage = entry.usage;
-                }
-                if entry.model.is_some() {
-                    self.model = entry.model.clone();
+                // 세션 한도 알림 같은 합성 엔트리는 대화에는 남지만 컨텍스트
+                // 측정값이 아니다. usage가 전부 0이고 모델이 `<synthetic>`이라,
+                // 그대로 받으면 CTX%가 0%로, MODEL이 `<synthetic>`으로 덮인다.
+                if !entry.synthetic {
+                    if entry.usage.is_some() {
+                        self.usage = entry.usage;
+                    }
+                    if entry.model.is_some() {
+                        self.model = entry.model.clone();
+                    }
                 }
                 self.latest = Some(entry);
             }
@@ -636,6 +653,32 @@ mod tests {
         assert_eq!(
             tr.summary().expect("summary").last_kind,
             EntryKind::UserInterrupted
+        );
+    }
+
+    /// 세션 한도에 걸리면 claude가 모델 `<synthetic>`, usage 전부 0인 assistant
+    /// 엔트리를 적는다. 그걸 실측으로 받으면 MODEL이 `<synthetic>`으로, CTX%가 0%로
+    /// 덮인다 - 컨텍스트는 한도에 걸렸다고 비워지지 않는다.
+    #[test]
+    fn a_rate_limit_notice_does_not_overwrite_the_measured_context() {
+        const LIMIT: &str = r#"{"type":"assistant","timestamp":"2026-09-15T19:41:00.000Z","isApiErrorMessage":true,"error":"rate_limit","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You have hit your session limit"}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        let mut tr = TranscriptTracker::new();
+        tr.apply(WAITING);
+        let before = tr.summary().expect("summary");
+        let measured = before.usage.expect("usage").total();
+        let model = before.model.clone().expect("model");
+
+        tr.apply(LIMIT);
+        let after = tr.summary().expect("summary");
+        assert_eq!(
+            after.usage.expect("usage").total(),
+            measured,
+            "한도 알림이 컨텍스트를 0으로 덮었다"
+        );
+        assert_eq!(
+            after.model.as_deref(),
+            Some(model.as_str()),
+            "한도 알림이 MODEL을 <synthetic>으로 덮었다"
         );
     }
 
