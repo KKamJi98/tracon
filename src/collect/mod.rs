@@ -540,20 +540,30 @@ impl Collector {
                         None => continue,
                     },
                 };
-                let last_ms =
-                    antigravity::last_activity_ms(&agy_root, &uuid).unwrap_or(p.started_at_ms);
-                // 파일이 움직였을 때만 다시 읽는다 - SQLite를 tick마다 열 이유가 없다.
+                // 진행 중에도 갱신되는 평문 transcript가 있으면 그 마지막 단계가
+                // 파일 mtime보다 정확하다 - 언제 움직였는지가 아니라 누구 차례인지를
+                // 알려 준다.
+                let step = antigravity::last_step(&agy_root, &uuid);
+                let db_ms = antigravity::last_activity_ms(&agy_root, &uuid);
+                let last_ms = step
+                    .as_ref()
+                    .map(|s| s.ts_ms)
+                    .or(db_ms)
+                    .unwrap_or(p.started_at_ms);
+                // 대화 SQLite는 파일이 움직였을 때만 다시 읽는다 - tick마다 열 이유가 없다.
+                let cache_key = db_ms.unwrap_or(last_ms);
                 let info = match self.agy_cache.get(&uuid) {
-                    Some((seen_at, info)) if *seen_at == last_ms => info.clone(),
+                    Some((seen_at, info)) if *seen_at == cache_key => info.clone(),
                     _ => {
                         let fresh =
                             antigravity::read_conversation(&agy_root, &uuid).unwrap_or_default();
                         self.agy_cache
-                            .insert(uuid.clone(), (last_ms, fresh.clone()));
+                            .insert(uuid.clone(), (cache_key, fresh.clone()));
                         fresh
                     }
                 };
-                let (state, confidence) = antigravity::infer(now_ms - last_ms, &self.cfg);
+                let (state, confidence) =
+                    antigravity::infer(step.as_ref(), now_ms - last_ms, &self.cfg);
                 sessions.push(Session {
                     key: SessionKey {
                         provider: Provider::Antigravity,

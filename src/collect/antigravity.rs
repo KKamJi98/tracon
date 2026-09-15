@@ -256,25 +256,84 @@ fn varint(bytes: &[u8], mut i: usize) -> Option<(u64, usize)> {
     None
 }
 
-/// 마지막 활동으로부터 흐른 시간으로 상태를 정한다.
+/// `brain/<uuid>/.system_generated/logs/transcript.jsonl`의 마지막 단계.
 ///
-/// Antigravity에는 claude의 훅도, codex의 `task_complete`도, 대화 엔트리의 종류도
-/// 없다 - 읽을 수 있는 것은 대화 파일이 언제 마지막으로 움직였는가뿐이다. 그래서
-/// 확신은 언제나 Low다. grace 안이면 아직 돌고 있다고 보고, 그 뒤는 Idle로 두면
-/// `demote`가 하루 뒤 Stale까지 내려 준다.
+/// 대화 SQLite와 달리 이건 평문 jsonl이고 진행 중에도 갱신된다. 파일 mtime만 보면
+/// "뭔가 움직였다"까지밖에 모르지만, 여기에는 단계의 종류와 상태가 그대로 적혀 있어
+/// claude/codex와 같은 급으로 읽을 수 있다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastStep {
+    pub kind: String,
+    pub status: String,
+    pub ts_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct RawStep {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    status: Option<String>,
+    created_at: Option<String>,
+}
+
+/// 마지막으로 완결된 줄만 본다. 쓰는 중이라 꼬리가 잘려 있을 수 있으므로, 끝에서
+/// 거슬러 올라가며 파싱되는 첫 줄을 쓴다.
+pub fn last_step(root: &Path, uuid: &str) -> Option<LastStep> {
+    let path = root
+        .join("brain")
+        .join(uuid)
+        .join(".system_generated/logs/transcript.jsonl");
+    let chunk = read_tail(&path, 64 * 1024)?;
+    chunk.lines().rev().find_map(parse_step)
+}
+
+fn parse_step(line: &str) -> Option<LastStep> {
+    let raw: RawStep = serde_json::from_str(line).ok()?;
+    Some(LastStep {
+        kind: raw.kind?,
+        status: raw.status?,
+        ts_ms: crate::collect::transcript::parse_ts_ms(&raw.created_at?)?,
+    })
+}
+
+fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.take(len - start).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 마지막 단계가 누구 차례였는지로 상태를 정한다. claude에서와 같은 규칙이다 -
+/// 흐른 시간이나 CPU가 아니라 마지막에 무슨 일이 있었는지를 본다.
+///
+/// 단계가 아직 `RUNNING`이면 에이전트가 도구를 돌리는 중이고, 사용자 입력이 마지막
+/// 이면 응답을 만드는 중이다. 모델 응답이 끝나 있으면 다음 차례는 사람이다.
+/// 훅이 없어 사실로 확정할 수는 없으므로 확신은 Medium을 넘기지 않는다.
 pub fn infer(
+    step: Option<&LastStep>,
     age_ms: i64,
     cfg: &crate::config::Thresholds,
 ) -> (crate::model::State, crate::model::Confidence) {
-    let state = if age_ms <= cfg.running_grace_ms {
-        crate::model::State::RunningInference
-    } else {
-        crate::model::State::Idle
+    use crate::model::{Confidence, State};
+    let Some(step) = step else {
+        // transcript를 못 읽었다. 파일이 움직였다는 것 말고는 아는 게 없다.
+        let state = if age_ms <= cfg.running_grace_ms {
+            State::RunningInference
+        } else {
+            State::Idle
+        };
+        return (crate::model::demote(state, age_ms, cfg), Confidence::Low);
     };
-    (
-        crate::model::demote(state, age_ms, cfg),
-        crate::model::Confidence::Low,
-    )
+    let (state, confidence) = match (step.status.as_str(), step.kind.as_str()) {
+        (_, "USER_INPUT") => (State::RunningInference, Confidence::Medium),
+        ("RUNNING", _) => (State::RunningTool, Confidence::Medium),
+        _ => (State::WaitingInput, Confidence::Medium),
+    };
+    (crate::model::demote(state, age_ms, cfg), confidence)
 }
 
 #[cfg(test)]
@@ -283,6 +342,42 @@ mod tests {
 
     /// 실행 중인 `agy`의 열린 파일 목록에서 대화 uuid를 떼어 낸다. brain 아래에는
     /// uuid가 아닌 디렉터리도 있으므로 모양을 확인하고 받는다.
+    /// 마지막 단계가 누구 차례였는지로 정한다. 흐른 시간이나 CPU가 아니다.
+    #[test]
+    fn the_last_step_decides_the_state() {
+        let cfg = crate::config::Thresholds::default();
+        let step = |kind: &str, status: &str| LastStep {
+            kind: kind.into(),
+            status: status.into(),
+            ts_ms: 0,
+        };
+        use crate::model::State;
+        assert_eq!(
+            infer(Some(&step("USER_INPUT", "DONE")), 5_000, &cfg).0,
+            State::RunningInference,
+            "사용자가 말한 뒤는 에이전트 차례다"
+        );
+        assert_eq!(
+            infer(Some(&step("GENERIC", "RUNNING")), 5_000, &cfg).0,
+            State::RunningTool
+        );
+        assert_eq!(
+            infer(Some(&step("PLANNER_RESPONSE", "DONE")), 5_000, &cfg).0,
+            State::WaitingInput
+        );
+        // transcript를 못 읽으면 확신을 낮춘다.
+        assert_eq!(infer(None, 5_000, &cfg).1, crate::model::Confidence::Low);
+    }
+
+    /// 쓰는 중이라 꼬리가 잘릴 수 있다. 끝에서 거슬러 올라가며 성한 줄을 쓴다.
+    #[test]
+    fn a_truncated_trailing_line_is_skipped() {
+        let good = r#"{"step_index":39,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-15T10:47:55Z"}"#;
+        assert!(parse_step(good).is_some());
+        assert!(parse_step(r#"{"step_index":40,"type":"GEN"#).is_none());
+        assert_eq!(parse_step(good).expect("step").kind, "PLANNER_RESPONSE");
+    }
+
     #[test]
     fn a_brain_path_yields_the_conversation_uuid() {
         let line = "agy 64805 ethan 42u DIR 1,18 96 123 /Users/x/.gemini/antigravity-cli/brain/e781d9ec-d4d3-40b0-a59d-ddd8dbc3cd3f/scratch";

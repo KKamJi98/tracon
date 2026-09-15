@@ -100,10 +100,22 @@ tied together as a fact instead of a guess.
 
 Model and context usage are decoded out of the conversation's `gen_metadata`.
 That layout was observed, not published, so every field is dropped rather than
-guessed at when it does not look right. The session name stays `-` while a
-conversation is in progress: Antigravity only writes a title into its summary
-database once the conversation is over, and tracon will not invent one from the
-conversation itself.
+guessed at when it does not look right.
+
+State does not come from the database. Alongside it, under
+`brain/<conversation-id>/.system_generated/logs/`, Antigravity keeps a plain
+jsonl transcript that it updates as it goes, and each line carries the kind of
+step and whether it is still running. So the same rule applies here as
+everywhere else: the state follows whose turn it was at the last step, not how
+long the file has been quiet.
+
+The session name stays `-` while a conversation is in progress. Antigravity
+writes a title into its summary database only once the conversation is over -
+of six conversations on this machine, two had one - and tracon will not invent
+one from the conversation itself.
+
+Enter copies `agy --conversation=<id>`, which is how agy takes a conversation
+back, rather than the `--resume` the other two use.
 
 Reading the database needs the `sqlite3` command. Where it is missing, agy rows
 drop out and the rest of tracon carries on, the same way it does without cmux.
@@ -147,7 +159,7 @@ lower-confidence guess. Fact-confidence sources always win over inference.
 |---|---|---|---|
 | **claude** | all states, inferred (low/medium confidence) | all states, fact (hook events) | all states, fact |
 | **codex** | all states, inferred; waiting-for-input is fact when the trailing event is `task_complete` | not wired up yet - `tracon hooks install` only installs claude hooks | all states, fact, when cmux forwards codex hook events |
-| **agy** | running or idle, from when the conversation file last moved; model and context read from the conversation database | no hooks | not forwarded |
+| **agy** | all states, from the step transcript; model and context read from the conversation database | no hooks | not forwarded |
 
 ## Install
 
