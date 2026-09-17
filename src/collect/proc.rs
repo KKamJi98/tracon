@@ -20,6 +20,7 @@ pub trait ProcessSource: Send {
 }
 
 pub fn session_id_from_argv(argv: &[String]) -> Option<String> {
+    let mut resumed: Option<String> = None;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         if let Some(v) = a.strip_prefix("--session-id=") {
@@ -28,8 +29,39 @@ pub fn session_id_from_argv(argv: &[String]) -> Option<String> {
         if a == "--session-id" {
             return it.next().cloned();
         }
+        // `--resume`는 uuid도 세션 이름("Jenkins Upgrade")도 받는다. uuid일 때만
+        // 신원이다 - 이어 쓰는 transcript의 파일명이 그 uuid이기 때문이다(실측:
+        // 905fb4b6 세션은 3주에 걸쳐 여러 번 resume됐지만 파일도 sessionId도 하나다).
+        // 이름은 파일명이 되지 못하므로 버리고, 아래 mtime 추측 경로로 내려보낸다.
+        //
+        // `--session-id`가 뒤에 또 나올 수 있으므로 여기서 바로 돌려주지 않고 들고만 간다.
+        let candidate = match a.strip_prefix("--resume=") {
+            Some(v) => Some(v.to_string()),
+            None if a == "--resume" => it.next().cloned(),
+            None => None,
+        };
+        if let Some(v) = candidate {
+            if is_uuid(&v) {
+                resumed = Some(v);
+            }
+        }
     }
-    None
+    resumed
+}
+
+/// 8-4-4-4-12 hex. claude가 transcript 파일명으로 쓰는 형태다.
+fn is_uuid(s: &str) -> bool {
+    let groups = [8, 4, 4, 4, 12];
+    let mut parts = s.split('-');
+    for want in groups {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.len() != want || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    parts.next().is_none()
 }
 
 /// argv[0]의 파일명만 본다. 래퍼가 인자로 에이전트 이름을 넘기는 경우는 제외한다.
@@ -151,6 +183,57 @@ mod tests {
     fn extracts_session_id_with_equals_form() {
         let a = argv(&["claude", "--session-id=abc-456"]);
         assert_eq!(session_id_from_argv(&a).as_deref(), Some("abc-456"));
+    }
+
+    #[test]
+    fn resume_with_uuid_is_the_session_id() {
+        let a = argv(&["claude", "--resume", "09775af0-3d97-411e-885b-6b9e1caec6e2"]);
+        assert_eq!(
+            session_id_from_argv(&a).as_deref(),
+            Some("09775af0-3d97-411e-885b-6b9e1caec6e2")
+        );
+    }
+
+    #[test]
+    fn resume_with_uuid_equals_form_is_the_session_id() {
+        let a = argv(&["claude", "--resume=905fb4b6-80f0-4c2d-8cdf-d42c981d45ff"]);
+        assert_eq!(
+            session_id_from_argv(&a).as_deref(),
+            Some("905fb4b6-80f0-4c2d-8cdf-d42c981d45ff")
+        );
+    }
+
+    /// `--session-id`가 이기는 규칙은 "먼저 만나면 즉시 돌려준다"는 구조에 기대고
+    /// 있다. 나중에 `--resume`처럼 끝까지 훑어 마지막에 정하는 형태로 정리하면
+    /// 조용히 뒤집히므로, 두 순서를 모두 고정해 둔다.
+    #[test]
+    fn session_id_outranks_resume_whatever_the_order() {
+        let want = Some("b1c8feb3-6baf-4aa3-8e07-eb1dc2779b29");
+        let resume_first = argv(&[
+            "claude",
+            "--resume",
+            "09775af0-3d97-411e-885b-6b9e1caec6e2",
+            "--session-id",
+            "b1c8feb3-6baf-4aa3-8e07-eb1dc2779b29",
+        ]);
+        assert_eq!(session_id_from_argv(&resume_first).as_deref(), want);
+
+        let session_id_first = argv(&[
+            "claude",
+            "--session-id",
+            "b1c8feb3-6baf-4aa3-8e07-eb1dc2779b29",
+            "--resume",
+            "09775af0-3d97-411e-885b-6b9e1caec6e2",
+        ]);
+        assert_eq!(session_id_from_argv(&session_id_first).as_deref(), want);
+    }
+
+    /// `--resume`는 세션 이름도 받는다. 이름은 uuid가 아니므로 transcript 파일명이
+    /// 되지 못한다 - 신원으로 쓰면 없는 경로를 가리킨다.
+    #[test]
+    fn resume_with_session_name_is_not_a_session_id() {
+        let a = argv(&["claude", "--resume", "Jenkins Upgrade"]);
+        assert_eq!(session_id_from_argv(&a), None);
     }
 
     #[test]
