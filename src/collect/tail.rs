@@ -51,7 +51,7 @@ impl Tailer {
     /// 조각을 만나면 멈춘다. 상한이 있어야 하는 이유는 transcript가 수십 MB까지
     /// 자라기 때문이다 - 못 찾는 파일 하나 때문에 매 tick 전체를 읽을 수는 없다.
     /// 첫 창은 `read_new`의 최초 읽기와 같아, 대다수 파일은 한 바퀴로 끝난다.
-    pub const PRIME_WINDOWS: [usize; 4] = [
+    const PRIME_WINDOWS: [usize; 4] = [
         Self::TAIL_BYTES,
         4 * Self::TAIL_BYTES,
         16 * Self::TAIL_BYTES,
@@ -70,13 +70,14 @@ impl Tailer {
     /// 넘겨 마지막 대화 줄을 창 밖으로 밀어낸 파일이 있었고(5.5MB/2304줄, 272KB/30줄),
     /// 그 세션은 화면에서 영영 `unknown`이었다.
     ///
-    /// 가장 넓은 창까지 가도 못 찾으면 그 창을 그대로 돌려준다. 어느 경우든 커서는
-    /// 마지막 완결 줄 경계에 놓이므로 다음 [`read_new`](Self::read_new)는 델타만 준다.
+    /// 가장 넓은 창까지 가도 못 찾으면 그 창을 그대로 돌려준다. 어느 경우든 다음
+    /// [`read_new`](Self::read_new)는 델타만 준다 - 커서는 마지막 완결 줄 경계에,
+    /// 창 안에 개행이 하나도 없었으면 그 줄 한복판에 남고 남은 줄은 다음 읽기가 버린다.
     pub fn prime(&mut self, path: &Path, accept: impl Fn(&str) -> bool) -> std::io::Result<String> {
         let len = std::fs::metadata(path)?.len();
         let mut out = String::new();
-        for (i, window) in Self::PRIME_WINDOWS.iter().enumerate() {
-            let start = len.saturating_sub(*window as u64);
+        for window in Self::PRIME_WINDOWS {
+            let start = len.saturating_sub(window as u64);
             // 커서를 그 창의 시작으로 물린 뒤 평소 경로로 읽는다 - 잘린 첫 줄 버리기,
             // 미완결 꼬리 남기기, 커서 갱신이 전부 `read_new`와 같은 규칙을 탄다.
             self.cursors.insert(
@@ -87,9 +88,8 @@ impl Tailer {
                 },
             );
             out = self.read_new(path)?;
-            let whole_file = start == 0;
-            let last_window = i + 1 == Self::PRIME_WINDOWS.len();
-            if accept(&out) || whole_file || last_window {
+            // 창이 파일 전체를 덮었으면 더 넓혀도 같은 조각이다.
+            if accept(&out) || start == 0 {
                 break;
             }
         }
@@ -245,6 +245,23 @@ mod tests {
         let out = t.prime(&p, |_| false).expect("prime");
         assert_eq!(out, "line1\nline2\n");
         assert_eq!(t.read_new(&p).expect("delta"), "");
+    }
+
+    /// 가장 넓은 창에도 개행이 없을 수 있다 - 실측 transcript에는 131KB짜리 단일
+    /// 라인이 있었다. 그때도 창 확장은 멈춰야 하고, 줄이 완결된 뒤에는 통째로 한 번
+    /// 와야 한다.
+    #[test]
+    fn prime_on_a_file_without_a_newline_defers_the_line_instead_of_tearing_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("oneline.jsonl");
+        let head = "x".repeat(5_000);
+        write(&p, &head);
+
+        let mut t = Tailer::new();
+        assert_eq!(t.prime(&p, |c| !c.is_empty()).expect("prime"), "");
+
+        write(&p, "y\n");
+        assert_eq!(t.read_new(&p).expect("delta"), format!("{head}y\n"));
     }
 
     #[test]

@@ -21,43 +21,53 @@ pub trait ProcessSource: Send {
 
 pub fn session_id_from_argv(argv: &[String]) -> Option<String> {
     let mut resumed: Option<String> = None;
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
+    for (i, a) in argv.iter().enumerate() {
         if let Some(v) = a.strip_prefix("--session-id=") {
             return Some(v.to_string());
         }
         if a == "--session-id" {
-            return it.next().cloned();
+            if let Some(v) = value_after(argv, i) {
+                return Some(v.clone());
+            }
         }
-        // `--resume`는 uuid도 세션 이름("Jenkins Upgrade")도 받는다. uuid일 때만
-        // 신원이다 - 이어 쓰는 transcript의 파일명이 그 uuid이기 때문이다(실측:
-        // 905fb4b6 세션은 3주에 걸쳐 여러 번 resume됐지만 파일도 sessionId도 하나다).
-        // 이름은 파일명이 되지 못하므로 버리고, 아래 mtime 추측 경로로 내려보낸다.
+        // `--resume`는 uuid도 세션 이름("resume by name")도 받는다. uuid일 때만
+        // 신원이다 - 이어 쓰는 transcript의 파일명이 그 uuid이기 때문이다(실측: 한
+        // 세션이 세 주에 걸쳐 여러 번 resume됐지만 파일도 sessionId도 하나였다).
+        // 이름은 파일명이 되지 못하므로 버리고, mtime 추측 경로로 내려보낸다.
         //
-        // `--session-id`가 뒤에 또 나올 수 있으므로 여기서 바로 돌려주지 않고 들고만 간다.
+        // `--session-id`가 뒤에 또 나올 수 있으므로 바로 돌려주지 않고 들고만 간다.
         let candidate = match a.strip_prefix("--resume=") {
-            Some(v) => Some(v.to_string()),
-            None if a == "--resume" => it.next().cloned(),
+            Some(v) => Some(v),
+            None if a == "--resume" => value_after(argv, i).map(String::as_str),
             None => None,
         };
-        if let Some(v) = candidate {
-            if is_uuid(&v) {
-                resumed = Some(v);
-            }
+        if let Some(v) = candidate.filter(|v| is_transcript_uuid(v)) {
+            resumed = Some(v.to_string());
         }
     }
     resumed
 }
 
-/// 8-4-4-4-12 hex. claude가 transcript 파일명으로 쓰는 형태다.
-fn is_uuid(s: &str) -> bool {
-    let groups = [8, 4, 4, 4, 12];
+/// `i`번째 플래그에 붙은 값. 다음 인자가 `-`로 시작하면 값이 아니라 다음 플래그다 -
+/// `claude --resume`은 값 없이도 쓰고(대화형 선택), 그때 뒤따르는 플래그를 값으로
+/// 삼키면 그 플래그가 통째로 사라진다.
+fn value_after(argv: &[String], i: usize) -> Option<&String> {
+    argv.get(i + 1).filter(|v| !v.starts_with('-'))
+}
+
+/// claude가 transcript 파일명으로 쓰는 모양인지: 소문자 hex 8-4-4-4-12.
+///
+/// codex([`codex::is_uuid_like`](crate::collect::codex))와 agy에도 비슷한 검사기가
+/// 있지만 기준이 셋 다 다르다 - 여기만 소문자를 요구한다. 이 값이 그대로 파일명이
+/// 되므로, 대소문자를 구분하는 파일시스템에서 대문자를 받으면 없는 경로에 세션을
+/// 고정한다. 하나로 합치려면 엄격도 옵션을 받는 함수가 되어야 해서 그대로 둔다.
+fn is_transcript_uuid(s: &str) -> bool {
     let mut parts = s.split('-');
-    for want in groups {
+    for want in [8, 4, 4, 4, 12] {
         let Some(part) = parts.next() else {
             return false;
         };
-        if part.len() != want || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if part.len() != want || !part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return false;
         }
     }
@@ -187,19 +197,19 @@ mod tests {
 
     #[test]
     fn resume_with_uuid_is_the_session_id() {
-        let a = argv(&["claude", "--resume", "09775af0-3d97-411e-885b-6b9e1caec6e2"]);
+        let a = argv(&["claude", "--resume", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"]);
         assert_eq!(
             session_id_from_argv(&a).as_deref(),
-            Some("09775af0-3d97-411e-885b-6b9e1caec6e2")
+            Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
         );
     }
 
     #[test]
     fn resume_with_uuid_equals_form_is_the_session_id() {
-        let a = argv(&["claude", "--resume=905fb4b6-80f0-4c2d-8cdf-d42c981d45ff"]);
+        let a = argv(&["claude", "--resume=1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9"]);
         assert_eq!(
             session_id_from_argv(&a).as_deref(),
-            Some("905fb4b6-80f0-4c2d-8cdf-d42c981d45ff")
+            Some("1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9")
         );
     }
 
@@ -208,22 +218,22 @@ mod tests {
     /// 조용히 뒤집히므로, 두 순서를 모두 고정해 둔다.
     #[test]
     fn session_id_outranks_resume_whatever_the_order() {
-        let want = Some("b1c8feb3-6baf-4aa3-8e07-eb1dc2779b29");
+        let want = Some("2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f");
         let resume_first = argv(&[
             "claude",
             "--resume",
-            "09775af0-3d97-411e-885b-6b9e1caec6e2",
+            "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
             "--session-id",
-            "b1c8feb3-6baf-4aa3-8e07-eb1dc2779b29",
+            "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
         ]);
         assert_eq!(session_id_from_argv(&resume_first).as_deref(), want);
 
         let session_id_first = argv(&[
             "claude",
             "--session-id",
-            "b1c8feb3-6baf-4aa3-8e07-eb1dc2779b29",
+            "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
             "--resume",
-            "09775af0-3d97-411e-885b-6b9e1caec6e2",
+            "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
         ]);
         assert_eq!(session_id_from_argv(&session_id_first).as_deref(), want);
     }
@@ -232,8 +242,33 @@ mod tests {
     /// 되지 못한다 - 신원으로 쓰면 없는 경로를 가리킨다.
     #[test]
     fn resume_with_session_name_is_not_a_session_id() {
-        let a = argv(&["claude", "--resume", "Jenkins Upgrade"]);
+        let a = argv(&["claude", "--resume", "resume by name"]);
         assert_eq!(session_id_from_argv(&a), None);
+    }
+
+    /// claude가 쓰는 transcript 파일명은 소문자 hex다. 대문자를 받아들이면
+    /// 대소문자를 구분하는 파일시스템에서 없는 경로에 세션을 고정한다 - 추측
+    /// 경로로 내려보내는 편이 낫다.
+    #[test]
+    fn resume_with_an_uppercase_uuid_is_not_a_session_id() {
+        let a = argv(&["claude", "--resume", "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D"]);
+        assert_eq!(session_id_from_argv(&a), None);
+    }
+
+    /// `claude --resume`는 값 없이도 쓴다(대화형 선택). 그때 뒤따르는 플래그를
+    /// 값으로 삼켜 버리면 그 플래그가 통째로 사라진다.
+    #[test]
+    fn a_valueless_resume_does_not_swallow_the_next_flag() {
+        let a = argv(&[
+            "claude",
+            "--resume",
+            "--session-id",
+            "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
+        ]);
+        assert_eq!(
+            session_id_from_argv(&a).as_deref(),
+            Some("2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f")
+        );
     }
 
     #[test]
