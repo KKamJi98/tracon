@@ -453,6 +453,14 @@ impl TranscriptTracker {
     }
 }
 
+/// 조각 안에 대화 엔트리가 한 줄이라도 있는지. 판단 기준을 [`TranscriptTracker`]와
+/// 하나로 묶어 둔다 - 사이드체인/메타 줄 취급을 여기서 따로 세면 둘이 갈라진다.
+pub fn has_conversation_entry(chunk: &str) -> bool {
+    let mut probe = TranscriptTracker::new();
+    probe.apply(chunk);
+    probe.summary().is_some()
+}
+
 /// 모델 신원을 못 본 세션의 마지막 폴백. `message.model`에는 1M 변종 표시가 없어
 /// 관측 토큰 수로 짐작할 수밖에 없고, 관측값이 200k를 넘으면 1M 세션으로 본다.
 ///

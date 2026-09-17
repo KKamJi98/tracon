@@ -399,39 +399,48 @@ impl Collector {
             // 폴백보다 우선한다.
             let mut window_fact: Option<u64> = None;
             let summary = match path {
-                Some(path) => {
-                    let chunk = self.tailer.read_new(path).unwrap_or_default();
-                    match key.provider {
-                        // 위에서 걸러져 여기까지 오지 않는다.
-                        Provider::Antigravity => None,
-                        Provider::Claude => {
-                            let tracker = match self.trackers.entry(path.clone()) {
-                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                                // 처음 보는 transcript다. 모델 신원은 파일 첫머리에
-                                // 한 번만 적히고 다시 나오지 않으므로, 끝만 보는
-                                // Tailer로는 영영 못 만난다 - 여기서 앞부분을 딱 한 번
-                                // 읽는다. 대화 엔트리는 일부러 건드리지 않는다.
-                                std::collections::hash_map::Entry::Vacant(e) => {
-                                    let mut fresh = transcript::TranscriptTracker::new();
-                                    if let Ok(head) = tail::read_head(path) {
-                                        fresh.apply_meta(&head);
-                                    }
-                                    e.insert(fresh)
+                Some(path) => match key.provider {
+                    // 위에서 걸러져 여기까지 오지 않는다.
+                    Provider::Antigravity => None,
+                    Provider::Claude => {
+                        let first_read = !self.trackers.contains_key(path);
+                        let chunk = if first_read {
+                            // 첫 읽기만 창을 넓힐 수 있게 한다. 한 창(64KB)이 전부
+                            // 메타 줄이면 상태도 모델도 이름도 못 읽어 세션이
+                            // `unknown`에 고정된다.
+                            self.tailer
+                                .prime(path, transcript::has_conversation_entry)
+                                .unwrap_or_default()
+                        } else {
+                            self.tailer.read_new(path).unwrap_or_default()
+                        };
+                        let tracker = match self.trackers.entry(path.clone()) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            // 처음 보는 transcript다. 모델 신원은 파일 첫머리에
+                            // 한 번만 적히고 다시 나오지 않으므로, 끝만 보는
+                            // Tailer로는 영영 못 만난다 - 여기서 앞부분을 딱 한 번
+                            // 읽는다. 대화 엔트리는 일부러 건드리지 않는다.
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                let mut fresh = transcript::TranscriptTracker::new();
+                                if let Ok(head) = tail::read_head(path) {
+                                    fresh.apply_meta(&head);
                                 }
-                            };
-                            tracker.apply(&chunk);
-                            window_fact = tracker.context_window();
-                            tracker.summary()
-                        }
-                        Provider::Codex => {
-                            let tracker = self.codex_trackers.entry(path.clone()).or_default();
-                            tracker.apply(&chunk);
-                            turn_ended = tracker.turn_ended();
-                            window_fact = tracker.context_window();
-                            tracker.summary()
-                        }
+                                e.insert(fresh)
+                            }
+                        };
+                        tracker.apply(&chunk);
+                        window_fact = tracker.context_window();
+                        tracker.summary()
                     }
-                }
+                    Provider::Codex => {
+                        let chunk = self.tailer.read_new(path).unwrap_or_default();
+                        let tracker = self.codex_trackers.entry(path.clone()).or_default();
+                        tracker.apply(&chunk);
+                        turn_ended = tracker.turn_ended();
+                        window_fact = tracker.context_window();
+                        tracker.summary()
+                    }
+                },
                 None => None,
             };
 
@@ -709,6 +718,39 @@ mod tests {
         assert_eq!(snap.sessions[0].ctx_tokens, Some(100_000));
         assert_eq!(snap.sessions[0].ctx_window, Some(200_000));
         assert_eq!(snap.sessions[0].ctx_pct(), Some(50));
+    }
+
+    /// 대화 줄이 꼬리 64KB 밖으로 밀려나면 세션이 `unknown`에 고정된다. 실측
+    /// transcript는 attachment 블롭과 메타 줄(cost-state, ai-title, artifact ledger)만으로
+    /// 그 창을 채운다. 게다가 요약이 없으면 `last_change`가 매 tick 현재 시각으로
+    /// 찍혀 LAST가 0s에 얼어붙고, demote가 걸리지 않아 idle로도 내려가지 못한다.
+    #[test]
+    fn a_conversation_buried_under_a_metadata_tail_still_drives_state() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proj = dir.path().join("-home-dev-app");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let line = r#"{"type":"assistant","timestamp":"2027-01-15T00:00:00.000Z","cwd":"/home/dev/app","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":0,"cache_read_input_tokens":100000,"cache_creation_input_tokens":0}}}"#;
+        let mut body = format!("{line}\n");
+        let blob = "y".repeat(4_000);
+        while body.len() < line.len() + crate::collect::tail::Tailer::TAIL_BYTES + 8_192 {
+            body.push_str(&format!(r#"{{"type":"attachment","content":"{blob}"}}"#));
+            body.push('\n');
+        }
+        std::fs::write(proj.join("u1.jsonl"), &body).expect("write");
+
+        let ts = crate::collect::transcript::parse_tail(line)
+            .expect("tail")
+            .last_ts_ms;
+        let mut c = super::Collector::new(
+            Box::new(FakeProcs(vec![proc(Some("u1"), "/home/dev/app", 0.0)])),
+            Thresholds::default(),
+        )
+        .with_projects_root(dir.path().to_path_buf());
+        let snap = c.snapshot(ts + 5_000);
+
+        assert_eq!(snap.sessions[0].state, State::WaitingInput);
+        assert_eq!(snap.sessions[0].ctx_tokens, Some(100_000));
+        assert_eq!(snap.sessions[0].last_change_ms, ts);
     }
 
     #[test]

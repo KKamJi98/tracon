@@ -47,8 +47,53 @@ impl Tailer {
     /// 최초 읽기에서 파일 끝에서 읽어들일 최대 바이트.
     pub const TAIL_BYTES: usize = 64 * 1024;
 
+    /// [`prime`](Self::prime)이 차례로 시도하는 창 크기. 좁은 쪽부터 가고, 쓸 만한
+    /// 조각을 만나면 멈춘다. 상한이 있어야 하는 이유는 transcript가 수십 MB까지
+    /// 자라기 때문이다 - 못 찾는 파일 하나 때문에 매 tick 전체를 읽을 수는 없다.
+    /// 첫 창은 `read_new`의 최초 읽기와 같아, 대다수 파일은 한 바퀴로 끝난다.
+    pub const PRIME_WINDOWS: [usize; 4] = [
+        Self::TAIL_BYTES,
+        4 * Self::TAIL_BYTES,
+        16 * Self::TAIL_BYTES,
+        64 * Self::TAIL_BYTES,
+    ];
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 처음 보는 파일의 첫 읽기. `accept`가 만족될 때까지 창을 넓혀 가며 끝에서
+    /// 거슬러 읽는다.
+    ///
+    /// [`TAIL_BYTES`](Self::TAIL_BYTES) 한 창만 보면 꼬리가 통째로 쓸모없는 줄일 때
+    /// 아무것도 못 건진다 - 실측 transcript에는 attachment 블롭과 메타 줄만으로 64KB를
+    /// 넘겨 마지막 대화 줄을 창 밖으로 밀어낸 파일이 있었고(5.5MB/2304줄, 272KB/30줄),
+    /// 그 세션은 화면에서 영영 `unknown`이었다.
+    ///
+    /// 가장 넓은 창까지 가도 못 찾으면 그 창을 그대로 돌려준다. 어느 경우든 커서는
+    /// 마지막 완결 줄 경계에 놓이므로 다음 [`read_new`](Self::read_new)는 델타만 준다.
+    pub fn prime(&mut self, path: &Path, accept: impl Fn(&str) -> bool) -> std::io::Result<String> {
+        let len = std::fs::metadata(path)?.len();
+        let mut out = String::new();
+        for (i, window) in Self::PRIME_WINDOWS.iter().enumerate() {
+            let start = len.saturating_sub(*window as u64);
+            // 커서를 그 창의 시작으로 물린 뒤 평소 경로로 읽는다 - 잘린 첫 줄 버리기,
+            // 미완결 꼬리 남기기, 커서 갱신이 전부 `read_new`와 같은 규칙을 탄다.
+            self.cursors.insert(
+                path.to_path_buf(),
+                Cursor {
+                    offset: start,
+                    mid_line: start > 0,
+                },
+            );
+            out = self.read_new(path)?;
+            let whole_file = start == 0;
+            let last_window = i + 1 == Self::PRIME_WINDOWS.len();
+            if accept(&out) || whole_file || last_window {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// 지난 호출 이후 늘어난 부분 중 **완결된 줄만** 돌려준다. 최초 호출은 끝에서
@@ -154,6 +199,52 @@ mod tests {
         let out = t.read_new(&p).expect("read");
         assert!(out.len() <= Tailer::TAIL_BYTES);
         assert!(!out.is_empty());
+    }
+
+    /// 꼬리 64KB가 전부 쓸모없는 줄이면 첫 읽기는 아무것도 못 건진다. 실측 transcript는
+    /// attachment 블롭과 메타 줄만으로 64KB를 넘겨 마지막 대화 줄을 창 밖으로 밀어낸다.
+    #[test]
+    fn prime_widens_the_window_until_the_chunk_is_accepted() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("buried.jsonl");
+        write(&p, "MARK\n");
+        let filler = format!("{}\n", "x".repeat(999));
+        for _ in 0..100 {
+            write(&p, &filler);
+        }
+        let mut t = Tailer::new();
+        let out = t.prime(&p, |c| c.contains("MARK")).expect("prime");
+        assert!(
+            out.contains("MARK"),
+            "창을 넓히지 않아 64KB 밖의 줄을 놓쳤다"
+        );
+    }
+
+    #[test]
+    fn prime_leaves_the_cursor_at_the_end_so_the_next_read_is_a_delta() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("a.jsonl");
+        write(&p, "MARK\n");
+        let filler = format!("{}\n", "x".repeat(999));
+        for _ in 0..100 {
+            write(&p, &filler);
+        }
+        let mut t = Tailer::new();
+        let _ = t.prime(&p, |c| c.contains("MARK")).expect("prime");
+        write(&p, "after\n");
+        assert_eq!(t.read_new(&p).expect("delta"), "after\n");
+    }
+
+    /// 끝까지 못 찾아도 멈춘다. 파일이 창보다 작으면 한 바퀴로 끝난다.
+    #[test]
+    fn prime_gives_up_and_returns_what_it_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("small.jsonl");
+        write(&p, "line1\nline2\n");
+        let mut t = Tailer::new();
+        let out = t.prime(&p, |_| false).expect("prime");
+        assert_eq!(out, "line1\nline2\n");
+        assert_eq!(t.read_new(&p).expect("delta"), "");
     }
 
     #[test]
