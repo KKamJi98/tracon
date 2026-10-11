@@ -48,9 +48,16 @@ jobs:
       # softprops/action-gh-release creates the release and uploads assets.
       contents: write
     steps:
+      # Flat layout regardless of artifact count: since download-artifact v5 a single artifact is extracted
+      # into dist/ itself, which dist/*/*.tar.gz would silently miss.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
+          pattern: tracon-*
+          merge-multiple: true
+      - run: ls -l dist/*.tar.gz
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: dist/*/*.tar.gz
+          files: dist/*.tar.gz
+          # Never publish a release without its binaries.
+          fail_on_unmatched_files: true
