@@ -159,13 +159,18 @@ mod tests {
     /// 확인하면 통과하는 것처럼 보이므로, 이 테스트는 한 source를 두 번 부른다.
     #[test]
     fn a_dead_agent_disappears_from_the_next_refresh() {
-        // basename만 보고 에이전트를 가리므로, sleep에 claude 이름을 붙여 띄운다.
-        let dir = tempfile::tempdir().expect("dir");
-        let fake = dir.path().join("claude");
-        std::os::unix::fs::symlink("/bin/sleep", &fake).expect("symlink");
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
 
-        let mut child = std::process::Command::new(&fake)
-            .arg("30")
+        // basename만 보고 에이전트를 가리므로, argv[0]을 claude로 두고 파이프에서 대기한다.
+        // Ubuntu 26.04의 /bin/sleep은 uutils multicall 바이너리라 symlink 이름(claude)으로
+        // 실행하면 즉시 종료한다. POSIX sh 내장 `read`는 외부 바이너리나 서브프로세스 없이 대기한다.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg0("claude")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
         let pid = child.id() as i32;
